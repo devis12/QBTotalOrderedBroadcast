@@ -2,7 +2,7 @@ package it.unitn.ds1;
 import akka.actor.AbstractActor;
 import akka.actor.ActorRef;
 import akka.actor.Props;
-import java.util.ArrayList;
+import java.util.List;
 import akka.actor.Cancellable;
 import java.util.Random;
 import scala.concurrent.duration.Duration;
@@ -17,13 +17,13 @@ public class Client extends AbstractActor {
   
   private Random rnd = new Random();
   // replicas that hold value v to be read and/or modified
-  private ArrayList<ActorRef> replicas;
+  private List<ActorRef> replicas;
 
-  public Client(ArrayList<ActorRef> replicas) {
+  public Client(List<ActorRef> replicas) {
     this.replicas = replicas;
   }
 
-  static public Props props(ArrayList<ActorRef> replicas) {
+  static public Props props(List<ActorRef> replicas) {
     return Props.create(Client.class, () -> new Client(replicas));
   }
 
@@ -34,11 +34,22 @@ public class Client extends AbstractActor {
 
   @Override
   public void preStart() {
-    Cancellable timer = getContext().system().scheduler().scheduleWithFixedDelay(
+    //read scheduling
+    Cancellable timerRead = getContext().system().scheduler().scheduleWithFixedDelay(
       Duration.create(1, TimeUnit.SECONDS),               // when to start generating messages
-      Duration.create(rnd.nextInt(3), TimeUnit.SECONDS),               // how frequently generate them
+      Duration.create(rnd.nextInt(16), TimeUnit.SECONDS),               // how frequently generate them
       selectRandomReplica(),                                           // destination actor reference
       new Request(getSelf(), RequestType.READ, null), // the message to send
+      getContext().system().dispatcher(),                 // system dispatcher
+      getSelf()                                           // source of the message (myself)
+    );
+
+    //write scheduling
+    Cancellable timerWrite = getContext().system().scheduler().scheduleWithFixedDelay(
+      Duration.create(rnd.nextInt(32), TimeUnit.SECONDS),               // when to start generating messages
+      Duration.create(rnd.nextInt(128), TimeUnit.SECONDS),               // how frequently generate them
+      selectRandomReplica(),                                           // destination actor reference
+      new Request(getSelf(), RequestType.WRITE, rnd.nextInt(10)), // the message to send
       getContext().system().dispatcher(),                 // system dispatcher
       getSelf()                                           // source of the message (myself)
     );
