@@ -8,6 +8,7 @@ import akka.actor.ActorRef;
 import akka.actor.ActorSystem;
 
 import it.unitn.ds1.Replica.JoinGroupMsg;
+import it.unitn.ds1.Replica.CrashMsg;
 import it.unitn.ds1.Client.SendReadRequest;
 import it.unitn.ds1.Client.SendWriteRequest;
 
@@ -60,6 +61,8 @@ public class QBTotalOrderBroadcast {
     clients.get(1).tell(new SendWriteRequest(2), null);
     Thread.sleep(260);
     clients.get(1).tell(new SendReadRequest(), null);
+    Thread.sleep(1200);
+    //replicas.get(3).tell(new CrashMsg(), null);//make the coordinator crash
 
     System.out.println(">>> Press ENTER to exit <<<");
     try {

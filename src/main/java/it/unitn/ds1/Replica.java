@@ -1,7 +1,10 @@
 package it.unitn.ds1;
+import akka.actor.Cancellable;
 import akka.actor.Props;
 import akka.actor.AbstractActor;
 import akka.actor.ActorRef;
+import scala.concurrent.duration.Duration;
+
 import java.io.Serializable;
 import java.util.Random;
 import java.util.List;
@@ -9,11 +12,24 @@ import java.util.ArrayList;
 import java.util.ArrayDeque;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.concurrent.TimeUnit;
 
 // The Replica actor
 public class Replica extends AbstractActor {
 
   public static class GenericMessage implements Serializable{}
+
+  public static class CrashMsg extends GenericMessage{}
+
+  //heartbeat msg sent by the coordinator
+  public static class CoordinatorHeartBeat extends GenericMessage{}
+  //coordinator notify itself that it is time to spawn a heartbeat msgs
+  public static class SendHeartBeat extends GenericMessage{}
+  //replicas notify themselves about the coordinator heartbeat not arrived
+  public static class HeartBeatNotArrived extends GenericMessage{}
+
+  private static int INTERVAL_HEARTBEAT = 1500;
+  private static int TIMEOUT_HEARTBEAT = 4500;
 
   public static class JoinGroupMsg extends GenericMessage {
     public final List<ActorRef> group; // list of group members
@@ -25,7 +41,6 @@ public class Replica extends AbstractActor {
   }
 
   public static enum RequestType {READ, WRITE};
-
   // This class represents a message request (r/w) from a client
   public static class Request extends GenericMessage{
     public final ActorRef client;
@@ -70,6 +85,13 @@ public class Replica extends AbstractActor {
       this.clock = clock;
       this.v = v;
     }
+    private static Update toUpdate(Object obj){//if an object has Update-like fields, it will be cloned in an Update obj
+      if(obj instanceof UpdateACK)
+        return new Update(((UpdateACK)obj).clock, ((UpdateACK)obj).v);
+      if(obj instanceof WriteOK)
+        return new Update(((WriteOK)obj).clock, ((WriteOK)obj).v);
+      return null;
+    }
   }
 
   // Update ack messages to be sent to coordinator
@@ -99,6 +121,8 @@ public class Replica extends AbstractActor {
   private int v;
   // coordinator reference
   private ActorRef coordinatorRef;
+  // timer for handling coordinator heartbeat (e.g. keep alive msg)
+  Cancellable timerHeartBeat;
   // is the replica a coordinator
   private boolean coordinator;
   //hashmap containing number of ack received for a given update 
@@ -107,15 +131,14 @@ public class Replica extends AbstractActor {
   private ArrayDeque<Update> pendingUpdates = new ArrayDeque<>();
   //local time wrt this replica, which consists in epoch+sequence number
   private LocalTime clock;
+  //has the replica crashed?
+  private boolean crashed;
 
   public Replica(int v, boolean coordinator){
     this.v = v;
     this.coordinator = coordinator;
     clock = new LocalTime(0,0);
-  }
-
-  public boolean isCoordinator(){
-    return coordinator;
+    crashed = false;
   }
 
   // Some stuff required by Akka to create actors of this type
@@ -123,7 +146,35 @@ public class Replica extends AbstractActor {
     return Props.create(Replica.class, () -> new Replica(v, coordinator));
   }
 
+  @Override
+  public void preStart() {
+    System.out.println("Starting heartbeat process");
+    if(coordinator)
+      timerHeartBeat = getContext().system().scheduler().scheduleWithFixedDelay(
+        Duration.create(1, TimeUnit.MILLISECONDS),               // when to start generating messages
+        Duration.create(INTERVAL_HEARTBEAT, TimeUnit.MILLISECONDS),               // how frequently generate them
+        getSelf(),                                           // destination actor reference
+        new SendHeartBeat(),                                // the message to send
+        getContext().system().dispatcher(),                 // system dispatcher
+        getSelf()                                           // source of the message (myself)
+      );
+
+    else
+      timerHeartBeat = getContext().system().scheduler().scheduleWithFixedDelay(
+        Duration.create(TIMEOUT_HEARTBEAT, TimeUnit.MILLISECONDS),               // when to start generating messages
+        Duration.create(TIMEOUT_HEARTBEAT, TimeUnit.MILLISECONDS),               // how frequently generate them
+        getSelf(),                                           // destination actor reference
+        new HeartBeatNotArrived(),                          // the message to send
+        getContext().system().dispatcher(),                 // system dispatcher
+        getSelf()                                           // source of the message (myself)
+      );
+
+  }
+
   private void sendMessage(ActorRef receiver, GenericMessage msg){
+    if(crashed)//don't answer to msg if state is crashed
+      return;
+
     if(msg.getClass() ==  Update.class)
       System.out.println(getSelf().path().name() + " sending UPDATE msg " + ((Update)msg).v + " " +
               ((Update)msg).clock.epoch + "-" + ((Update)msg).clock.sn + " to " + receiver.path().name());
@@ -139,12 +190,16 @@ public class Replica extends AbstractActor {
     receiver.tell(msg, getSelf());
 
     // simulate network delays using sleep
-    try { Thread.sleep(rnd.nextInt(10)); } 
+    try { Thread.sleep(rnd.nextInt(10)); }
     catch (InterruptedException e) { e.printStackTrace(); }
 
   }
+  /*  If broadcast equals true send also to itself
+  * */
+  private void multicastMessageToReplicas(GenericMessage msg, boolean broadcast){
+    if(crashed)//don't answer to msg if state is crashed
+      return;
 
-  private void multicastMessageToReplicas(GenericMessage msg){
     if(msg.getClass() == Update.class)
       System.out.println(getSelf().path().name() + " multicasting UPDATE msg " + ((Update)msg).v + " " +
               ((Update)msg).clock.epoch + "-" + ((Update)msg).clock.sn);
@@ -158,7 +213,8 @@ public class Replica extends AbstractActor {
 
     // multicast to all peers in the group
     for (ActorRef r: shuffledGroup)
-      sendMessage(r, msg);
+      if(broadcast || !r.equals(getSelf()))//avoid sending to yourself in multicast
+        sendMessage(r, msg);
     
   }
 
@@ -166,14 +222,6 @@ public class Replica extends AbstractActor {
   *   such that their clock value is less
   * */
   private boolean canDeliver(Update upd) {
-    for(Update pupd : pendingUpdates)
-      if(pupd.clock.epoch < upd.clock.epoch || pupd.clock.sn < upd.clock.sn)
-        return false;
-
-    return true;
-  }
-
-  private boolean canDeliver(WriteOK upd) {
     for(Update pupd : pendingUpdates)
       if(pupd.clock.epoch < upd.clock.epoch || pupd.clock.sn < upd.clock.sn)
         return false;
@@ -191,12 +239,24 @@ public class Replica extends AbstractActor {
   }
 
   private void onJoinGroupMsg(JoinGroupMsg msg) {
+    if(crashed)//don't answer to msg if state is crashed
+      return;
+
     this.replicas = msg.group;
     this.coordinatorRef = msg.coordinatorRef;
   }
 
+  /*  Need to enter in crashed mode
+  * */
+  private void onCrashMsg(CrashMsg cmsg) {
+    crashed = true;
+  }
+
   // Here we define our reaction on the received Request messages
   private void onRequest(Request r) {
+    if(crashed)//don't answer to msg if state is crashed
+      return;
+
     ActorRef sender = r.client;
     if(r.rtype == RequestType.READ) {
       System.out.println( "<"+ getSelf().path().name()+ "> received read request from client " + getSender().path().name());
@@ -209,13 +269,16 @@ public class Replica extends AbstractActor {
     }else if(r.rtype == RequestType.WRITE && coordinator){//I'm the coordinator, tell other replicas about the update
       System.out.println( "<"+ getSelf().path().name()+ "> received write request from client " + getSender().path().name());
       clock = LocalTime.newSequence(clock);//update clock
-      multicastMessageToReplicas(new Update(clock, r.v));
+      multicastMessageToReplicas(new Update(clock, r.v), true);
     }
 
   }
 
   // Here we define our reaction on the received Update messages
   private void onUpdate(Update upd) {
+    if(crashed)//don't answer to msg if state is crashed
+      return;
+
     pendingUpdates.addLast(upd);//add to pending updates to be performed
     for(Update pupd:pendingUpdates)
       System.out.println("<" + getSelf().path().name() + "> pending update: " + pupd.v + " " + pupd.clock.epoch + "-" + pupd.clock.sn);
@@ -225,6 +288,8 @@ public class Replica extends AbstractActor {
 
   // Here we define our reaction on the received UpdateACK messages
   private void onUpdateACK(UpdateACK upd) {
+    if(crashed)//don't answer to msg if state is crashed
+      return;
 
     //Update hashmap of clock, acks
     Integer acksReceived = ackMap.get(upd.clock);
@@ -238,14 +303,17 @@ public class Replica extends AbstractActor {
 
     int quorum = (((int) replicas.size())/2) + 1;
     if(acksReceived > quorum){//WRITEOK
-      multicastMessageToReplicas(new WriteOK(upd.clock, upd.v));
+      multicastMessageToReplicas(new WriteOK(upd.clock, upd.v), true);
     }
 
   }
 
   // Here we define our reaction on the received WriteOK messages, i.e. perform update
   private void onWriteOK(WriteOK wokUpd) {
-    if(canDeliver(wokUpd)){//check if wokupd can be performed
+    if(crashed)//don't answer to msg if state is crashed
+      return;
+
+    if(canDeliver(Update.toUpdate(wokUpd))){//check if wokupd can be performed
       //find update within pending updates
       Update updDel = null;
       for (Update update : pendingUpdates) {
@@ -266,12 +334,57 @@ public class Replica extends AbstractActor {
 
   }
 
+  /*  Coordinator heartbeat to signal the fact that it is still up
+  * */
+  private void onCoordinatorHeartBeat(CoordinatorHeartBeat msg) {
+    if(crashed)//don't answer to msg if state is crashed
+      return;
+    System.out.println("" + getSelf().path().name() + " received heartbeat from coordinator");
+
+    if(!coordinator){
+      timerHeartBeat.cancel();
+      timerHeartBeat = getContext().system().scheduler().scheduleWithFixedDelay(
+              Duration.create(TIMEOUT_HEARTBEAT, TimeUnit.MILLISECONDS),               // when to start generating messages
+              Duration.create(TIMEOUT_HEARTBEAT, TimeUnit.MILLISECONDS),               // how frequently generate them
+              getSelf(),                                           // destination actor reference
+              new HeartBeatNotArrived(),                          // the message to send
+              getContext().system().dispatcher(),                 // system dispatcher
+              getSelf()                                           // source of the message (myself)
+      );
+    }
+
+  }
+
+  /*  Coordinator heartbeat to signal the fact that it is still up
+   * */
+  private void onHeartBeatNotArrived(HeartBeatNotArrived msg) {
+    if(crashed)//don't answer to msg if state is crashed
+      return;
+
+    System.out.println("FAILURE OF THE COORDINATOR: heartbeat not arrived");
+    //TODO start election process
+  }
+
+  /*  Coordinator heartbeat to signal the fact that it is still up
+   * */
+  private void onSendHeartBeat(SendHeartBeat msg) {
+    if(crashed)//don't answer to msg if state is crashed
+      return;
+    System.out.println("" + getSelf().path().name() + ", aka coordinator sending heartbeats to everyone");
+
+    multicastMessageToReplicas(new CoordinatorHeartBeat(), false);
+  }
+
   // Here we define the mapping between the received message types
   // and our actor methods
   @Override
   public Receive createReceive() {
     return receiveBuilder()
       .match(JoinGroupMsg.class, this::onJoinGroupMsg)
+      .match(CrashMsg.class, this::onCrashMsg)
+      .match(CoordinatorHeartBeat.class, this::onCoordinatorHeartBeat)
+      .match(HeartBeatNotArrived.class, this::onHeartBeatNotArrived)
+      .match(SendHeartBeat.class, this::onSendHeartBeat)
       .match(Request.class, this::onRequest)
       .match(Update.class, this::onUpdate)
       .match(UpdateACK.class, this::onUpdateACK)
