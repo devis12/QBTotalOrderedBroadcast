@@ -7,7 +7,9 @@ import java.util.Collections;
 import akka.actor.ActorRef;
 import akka.actor.ActorSystem;
 
-import it.unitn.ds1.Message.JoinGroupMsg;
+import it.unitn.ds1.Replica.JoinGroupMsg;
+import it.unitn.ds1.Client.SendReadRequest;
+import it.unitn.ds1.Client.SendWriteRequest;
 
 public class QBTotalOrderBroadcast {
 
@@ -15,9 +17,10 @@ public class QBTotalOrderBroadcast {
   final static int N_CLIENTS = 2;
   final static int INIT_V = 16;
 
-  public static void main(String[] args) {
+  public static void main(String[] args) throws InterruptedException {
 
     List<ActorRef> replicas = new ArrayList<ActorRef>(); //list of available replicas
+    List<ActorRef> clients = new ArrayList<ActorRef>(); //list of available clients
     ActorRef initCoordinator = null; //initial coordinator
 
     // Create an actor system named "qbtotorderbroad"
@@ -45,15 +48,22 @@ public class QBTotalOrderBroadcast {
 
     // Create multiple Client actors that will contact any replicas for read/write operations on variable v
     for (int i=0; i<N_CLIENTS; i++) {
-      system.actorOf(
+      ActorRef c = system.actorOf(
           Client.props(replicas), 
           "client" + i);    // the new actor name (unique within the system)
+      clients.add(c);
     }
+
+    // define your flow of read and write operations
+    clients.get(0).tell(new SendReadRequest(), null);
+    clients.get(0).tell(new SendWriteRequest(5), null);
+    clients.get(1).tell(new SendWriteRequest(2), null);
+    Thread.sleep(260);
+    clients.get(1).tell(new SendReadRequest(), null);
 
     System.out.println(">>> Press ENTER to exit <<<");
     try {
       System.in.read();
-
     }
     catch (IOException ioe) {}
     finally {

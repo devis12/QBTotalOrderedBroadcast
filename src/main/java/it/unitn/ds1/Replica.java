@@ -9,18 +9,89 @@ import java.util.ArrayList;
 import java.util.ArrayDeque;
 import java.util.Collections;
 import java.util.HashMap;
-import it.unitn.ds1.Message.GenericMessage;
-import it.unitn.ds1.Message.Request;
-import it.unitn.ds1.Message.RequestType;
-import it.unitn.ds1.Message.Response;
-import it.unitn.ds1.Message.Update;
-import it.unitn.ds1.Message.UpdateACK;
-import it.unitn.ds1.Message.JoinGroupMsg;
-import it.unitn.ds1.Message.WriteOK;
 
 // The Replica actor
 public class Replica extends AbstractActor {
-  
+
+  public static class GenericMessage implements Serializable{}
+
+  public static class JoinGroupMsg extends GenericMessage {
+    public final List<ActorRef> group; // list of group members
+    public final ActorRef coordinatorRef; // coordinator reference
+    public JoinGroupMsg(List<ActorRef> group, ActorRef coordinatorRef) {
+      this.group = Collections.unmodifiableList(group);
+      this.coordinatorRef = coordinatorRef;
+    }
+  }
+
+  public static enum RequestType {READ, WRITE};
+
+  // This class represents a message request (r/w) from a client
+  public static class Request extends GenericMessage{
+    public final ActorRef client;
+    public final RequestType rtype;
+    public final Integer v;
+
+    /*
+      The following is a method to make the building of a read request easier
+    */
+    public Request(ActorRef client, RequestType rtype){
+      this.client = client;
+      this.rtype = rtype;//this will be a read request (write without value has no sense)
+      this.v = null;//value does not need to be set in case of read request
+    }
+
+    /*
+      Client request for read or write request which will be send to a replica
+    */
+    public Request(ActorRef client, RequestType rtype, Integer v) {
+      this.client = client;
+      this.rtype = rtype;
+      if(rtype == RequestType.READ)//value does not need to be set in case of read request
+        this.v = null;
+      else
+        this.v = v;
+    }
+  }
+
+  // This class represents a message response (r) from a client
+  public static class Response extends GenericMessage{
+    public final Integer v;
+    public Response(Integer v) {
+      this.v = v;
+    }
+  }
+
+  // Update messages to be sent in broadcast to all replicas by the coordinator
+  public static class Update extends GenericMessage{
+    public final LocalTime clock;
+    public final Integer v;
+    public Update(LocalTime clock, Integer v){
+      this.clock = clock;
+      this.v = v;
+    }
+  }
+
+  // Update ack messages to be sent to coordinator
+  public static class UpdateACK extends GenericMessage{
+    public final LocalTime clock;
+    public final Integer v;
+    public UpdateACK(LocalTime clock, Integer v){
+      this.clock = clock;
+      this.v = v;
+    }
+  }
+
+  // Update ack messages to be sent to coordinator
+  public static class WriteOK extends GenericMessage{
+    public final LocalTime clock;
+    public final Integer v;
+    public WriteOK(LocalTime clock, Integer v){
+      this.clock = clock;
+      this.v = v;
+    }
+  }
+
   private Random rnd = new Random();
   // replicas that hold value v to be read and/or modified
   private List<ActorRef> replicas;
@@ -53,6 +124,18 @@ public class Replica extends AbstractActor {
   }
 
   private void sendMessage(ActorRef receiver, GenericMessage msg){
+    if(msg.getClass() ==  Update.class)
+      System.out.println(getSelf().path().name() + " sending UPDATE msg " + ((Update)msg).v + " " +
+              ((Update)msg).clock.epoch + "-" + ((Update)msg).clock.sn + " to " + receiver.path().name());
+    if(msg.getClass() ==  UpdateACK.class)
+      System.out.println(getSelf().path().name() + " sending UPDATEACK msg " + ((UpdateACK)msg).v + " " +
+              ((UpdateACK)msg).clock.epoch + "-" + ((UpdateACK)msg).clock.sn + " to " + receiver.path().name());
+    if(msg.getClass() == WriteOK.class)
+      System.out.println(getSelf().path().name() + " sending WRITEOK msg " + ((WriteOK)msg).v + " " +
+              ((WriteOK)msg).clock.epoch + "-" + ((WriteOK)msg).clock.sn + " to " + receiver.path().name());
+
+    //try{Thread.sleep(2000);}catch(Exception e){}
+
     receiver.tell(msg, getSelf());
 
     // simulate network delays using sleep
@@ -62,14 +145,49 @@ public class Replica extends AbstractActor {
   }
 
   private void multicastMessageToReplicas(GenericMessage msg){
+    if(msg.getClass() == Update.class)
+      System.out.println(getSelf().path().name() + " multicasting UPDATE msg " + ((Update)msg).v + " " +
+              ((Update)msg).clock.epoch + "-" + ((Update)msg).clock.sn);
+    if(msg.getClass() == WriteOK.class)
+      System.out.println(getSelf().path().name() + " multicasting WRITEOK msg " + ((WriteOK)msg).v + " " +
+              ((WriteOK)msg).clock.epoch + "-" + ((WriteOK)msg).clock.sn);
+
     // randomly arrange replicas
     List<ActorRef> shuffledGroup = new ArrayList<>(replicas);
     Collections.shuffle(shuffledGroup);
 
     // multicast to all peers in the group
-    for (ActorRef r: shuffledGroup) 
+    for (ActorRef r: shuffledGroup)
       sendMessage(r, msg);
     
+  }
+
+  /*  Check if wokupd can be delivered, i.e. if there isn't any pending updates
+  *   such that their clock value is less
+  * */
+  private boolean canDeliver(Update upd) {
+    for(Update pupd : pendingUpdates)
+      if(pupd.clock.epoch < upd.clock.epoch || pupd.clock.sn < upd.clock.sn)
+        return false;
+
+    return true;
+  }
+
+  private boolean canDeliver(WriteOK upd) {
+    for(Update pupd : pendingUpdates)
+      if(pupd.clock.epoch < upd.clock.epoch || pupd.clock.sn < upd.clock.sn)
+        return false;
+
+    return true;
+  }
+
+  private void deliver(Update upd){
+    //perforn update
+    this.v = upd.v;
+    System.out.println("Replica " + getSelf().path().name() +
+            " update " + upd.clock.epoch + ":" + upd.clock.sn + " " + upd.v);
+    //delete from pending updates list
+    pendingUpdates.remove(upd);
   }
 
   private void onJoinGroupMsg(JoinGroupMsg msg) {
@@ -80,14 +198,17 @@ public class Replica extends AbstractActor {
   // Here we define our reaction on the received Request messages
   private void onRequest(Request r) {
     ActorRef sender = r.client;
-    if(r.rtype == RequestType.READ)
+    if(r.rtype == RequestType.READ) {
+      System.out.println( "<"+ getSelf().path().name()+ "> received read request from client " + getSender().path().name());
       sendMessage(sender, new Response(v));//return immediately local value
-    
-    else if(r.rtype == RequestType.WRITE && !coordinator)//forward write request to coordinator
+
+    }else if(r.rtype == RequestType.WRITE && !coordinator) {//forward write request to coordinator
+      System.out.println( "<"+ getSelf().path().name()+ "> received write request from client " + getSender().path().name());
       sendMessage(coordinatorRef, r);
 
-    else if(r.rtype == RequestType.WRITE && coordinator){//I'm the coordinator, tell other replicas about the update
-      clock.newSequence();//update clock
+    }else if(r.rtype == RequestType.WRITE && coordinator){//I'm the coordinator, tell other replicas about the update
+      System.out.println( "<"+ getSelf().path().name()+ "> received write request from client " + getSender().path().name());
+      clock = LocalTime.newSequence(clock);//update clock
       multicastMessageToReplicas(new Update(clock, r.v));
     }
 
@@ -95,7 +216,10 @@ public class Replica extends AbstractActor {
 
   // Here we define our reaction on the received Update messages
   private void onUpdate(Update upd) {
-    pendingUpdates.addFirst(upd);//add to pending updates to be performed
+    pendingUpdates.addLast(upd);//add to pending updates to be performed
+    for(Update pupd:pendingUpdates)
+      System.out.println("<" + getSelf().path().name() + "> pending update: " + pupd.v + " " + pupd.clock.epoch + "-" + pupd.clock.sn);
+
     sendMessage(coordinatorRef, new UpdateACK(upd.clock, upd.v));
   }
 
@@ -114,31 +238,31 @@ public class Replica extends AbstractActor {
 
     int quorum = (((int) replicas.size())/2) + 1;
     if(acksReceived > quorum){//WRITEOK
-      multicastMessageToReplicas(new WriteOK(clock, upd.v));
+      multicastMessageToReplicas(new WriteOK(upd.clock, upd.v));
     }
 
   }
 
   // Here we define our reaction on the received WriteOK messages, i.e. perform update
   private void onWriteOK(WriteOK wokUpd) {
+    if(canDeliver(wokUpd)){//check if wokupd can be performed
+      //find update within pending updates
+      Update updDel = null;
+      for (Update update : pendingUpdates) {
+        if(update.clock.equals(wokUpd.clock)){
+          updDel = update;
+        }
+      }
 
-    //find update within pending updates
-    Update updDel = null;
-    for (Update update : pendingUpdates) {
-      if(update.clock.equals(wokUpd.clock)){
-        updDel = update;
+      if(updDel != null){
+        deliver(updDel);
+        //check if other pending updates can be delivered
+        for(Update upd : pendingUpdates){
+          if(canDeliver(upd))
+            deliver(upd);
+        }
       }
     }
-
-    if(updDel != null){
-      //perforn update
-      this.v = wokUpd.v;
-      System.out.println("Replica " + getSelf().path().name() + 
-      " update " + wokUpd.clock.epoch + ":" + wokUpd.clock.sn + " " + wokUpd.v);
-      //delete from pending updates list
-      pendingUpdates.remove(updDel);
-    }
-    
 
   }
 
@@ -147,7 +271,7 @@ public class Replica extends AbstractActor {
   @Override
   public Receive createReceive() {
     return receiveBuilder()
-      .match(JoinGroupMsg.class,    this::onJoinGroupMsg)
+      .match(JoinGroupMsg.class, this::onJoinGroupMsg)
       .match(Request.class, this::onRequest)
       .match(Update.class, this::onUpdate)
       .match(UpdateACK.class, this::onUpdateACK)
