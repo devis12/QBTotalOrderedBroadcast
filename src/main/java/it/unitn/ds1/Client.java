@@ -34,7 +34,6 @@ public class Client extends AbstractActor {
 
   public static class TimeoutReadMsg implements Serializable {}
 
-  private Random rnd = new Random();
   // replicas that hold value v to be read and/or modified
   private List<ActorRef> replicas;
   // handle timeout for read request
@@ -49,7 +48,7 @@ public class Client extends AbstractActor {
   }
 
   private ActorRef selectRandomReplica(){
-    int randomPos = rnd.nextInt(replicas.size());
+    int randomPos = new Random(System.currentTimeMillis()).nextInt(replicas.size());
     return replicas.get(randomPos);
   }
 

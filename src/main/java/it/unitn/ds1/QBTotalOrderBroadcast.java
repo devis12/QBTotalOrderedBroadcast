@@ -62,7 +62,7 @@ public class QBTotalOrderBroadcast {
     Thread.sleep(260);
     clients.get(1).tell(new SendReadRequest(), null);
     Thread.sleep(1200);
-    //replicas.get(3).tell(new CrashMsg(), null);//make the coordinator crash
+    replicas.get(3).tell(new CrashMsg(), null);//make the coordinator crash
 
     System.out.println(">>> Press ENTER to exit <<<");
     try {
