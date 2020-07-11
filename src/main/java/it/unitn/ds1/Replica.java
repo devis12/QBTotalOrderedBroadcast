@@ -612,7 +612,7 @@ public class Replica extends AbstractActor {
   /*  Received ack from following replica during election process
   * */
   private void onElectionMsgACK(ElectionMsgACK msg) {
-    if(crashed == CrashType.GENERAL)//don't answer to msg if state is crashed
+    if(crashed == CrashType.GENERAL || !election)//don't answer to msg if state is crashed
       return;
     System.out.println("["+getSelf().path().name()+"] received ACK from " + getSender().path().name() + " during election");
     //cancel timeout for election msg ack
@@ -622,7 +622,7 @@ public class Replica extends AbstractActor {
   /*  Following replica seems to have failed as well, forward to next one
   * */
   private void onElectionACKTimeout(ElectionACKTimeout msg) {
-    if(crashed == CrashType.GENERAL)//don't answer to msg if state is crashed
+    if(crashed == CrashType.GENERAL || !election)//don't answer to msg if state is crashed
       return;
 
     System.out.println("["+getSelf().path().name()+"] not received ACK from " + msg.receivingReplica.path().name() + " during election");
@@ -637,7 +637,7 @@ public class Replica extends AbstractActor {
   /*  Received synchronization msg as result of convergence in election protocol
    * */
   private void onSynchronizationMsg(SynchronizationMsg msg) {
-    if(crashed == CrashType.GENERAL)//don't answer to msg if state is crashed
+    if(crashed == CrashType.GENERAL || !election)//don't answer to msg if state is crashed
       return;
 
     election = false;//election mode terminated
