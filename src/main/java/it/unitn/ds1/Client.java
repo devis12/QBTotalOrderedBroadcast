@@ -4,7 +4,15 @@ import akka.actor.ActorRef;
 import akka.actor.Cancellable;
 import akka.actor.Props;
 
+import java.io.File;
+import java.io.IOException;
 import java.io.Serializable;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Random;
 import java.util.concurrent.TimeUnit;
@@ -18,6 +26,8 @@ import scala.concurrent.duration.Duration;
 
 // The Client actor
 public class Client extends AbstractActor {
+
+  private static final String logFolderPath = "logs";
 
   private static int TIMEOUT_READ = 3000;
 
@@ -37,7 +47,7 @@ public class Client extends AbstractActor {
   // replicas that hold value v to be read and/or modified
   private List<ActorRef> replicas;
   // handle timeout for read request
-  Cancellable timeoutRead;
+  private Cancellable timeoutRead;
 
   public Client(List<ActorRef> replicas) {
     this.replicas = replicas;
@@ -52,8 +62,32 @@ public class Client extends AbstractActor {
     return replicas.get(randomPos);
   }
 
+  /*  Append log to logfile
+   * */
+  private void appendLog(String textToAppend){
+    try {
+      if(Files.notExists(Paths.get(logFolderPath)))
+        Files.createDirectory(Paths.get(logFolderPath));
+
+      Files.write(Paths.get(logFolderPath + File.separator + getSelf().path().name()+"_log.txt"), Arrays.asList(textToAppend), StandardCharsets.UTF_8,
+              StandardOpenOption.CREATE, StandardOpenOption.APPEND);  //Append mode
+    }catch(IOException ioe){
+      System.err.println("[" + getSelf().path().name() + "] IOException while writing in logfile " + Paths.get(getSelf().path().name()+"_log.txt").toAbsolutePath());
+    }
+  }
+
   @Override
   public void preStart() {
+    //delete previous runs logFile
+    try {
+      if(Files.exists(Paths.get(logFolderPath + File.separator + getSelf().path().name() + "_log.txt"))) {
+        System.out.println("[" + getSelf().path().name() + "] deleting previous runs logfile");
+        Files.delete(Paths.get(logFolderPath + File.separator + getSelf().path().name() + "_log.txt"));
+      }
+    }catch(IOException ioe){
+      System.err.println("[" + getSelf().path().name() + "] IOException while writing in logfile " + Paths.get(getSelf().path().name()+"_log.txt").toAbsolutePath());
+    }
+
     /*
     //read scheduling
     Cancellable timerRead = getContext().system().scheduler().scheduleWithFixedDelay(
@@ -80,18 +114,23 @@ public class Client extends AbstractActor {
   // Here we define our reaction on the received message from the replica containing the value we're interested
   private void onResponse(Response r) {
     timeoutRead.cancel();
-    System.out.println("Client <" +
+    System.out.println("[" +
             getSelf().path().name() +           // the name of the current actor
-            "> read done from " +
+            "] read done from " +
             getSender().path().name() +         // the name of the sender actor
             ", value: " + r.v                   // finally the message contents
     );
+
+    //log Client <ClientID> read done <value>
+    appendLog("Client " + getSelf().path().name() + " read done " + r.v);
   }
 
   //Method to trigger from externally the client to perform a read
   private void onSendReadRequest(SendReadRequest msg) {
     ActorRef replica = selectRandomReplica();
-    System.out.println(""+getSelf().path().name()+" ready to make a read request");
+    System.out.println("["+getSelf().path().name()+"] ready to make a read request");
+    //log  Client <ClientID> read req to <ReplicaID>
+    appendLog("Client " + getSelf().path().name() + " read req to " + replica.path().name());
     replica.tell(new Request(getSelf(), RequestType.READ, null), getSelf());
 
     //timeout for just performed read
@@ -114,7 +153,8 @@ public class Client extends AbstractActor {
 
   //Method to trigger from externally the client to perform a write
   private void onTimeoutRead(TimeoutReadMsg msg) {
-    System.out.println(""+getSelf().path().name()+" read request is FAILED!");
+    timeoutRead.cancel();//timeout has served its purpose
+    System.out.println("["+getSelf().path().name()+"] read request has FAILED!");
   }
 
   @Override

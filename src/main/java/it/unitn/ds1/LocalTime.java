@@ -42,6 +42,6 @@ public final class LocalTime implements Serializable{
 
     @Override
     public String toString(){
-        return "(" +this.epoch + "-" + this.sn  + ")";
+        return  this.epoch + ":" + this.sn ;
     }
 }

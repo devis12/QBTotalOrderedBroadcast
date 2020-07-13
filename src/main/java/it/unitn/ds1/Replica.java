@@ -5,17 +5,20 @@ import akka.actor.AbstractActor;
 import akka.actor.ActorRef;
 import scala.concurrent.duration.Duration;
 
+import java.io.File;
+import java.io.IOException;
 import java.io.Serializable;
-import java.util.Random;
-import java.util.List;
-import java.util.ArrayList;
-import java.util.ArrayDeque;
-import java.util.Collections;
-import java.util.HashMap;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
+import java.util.*;
 import java.util.concurrent.TimeUnit;
 
 // The Replica actor
 public class Replica extends AbstractActor {
+
+  private static final String logFolderPath = "logs";
 
   //interval to generate heartbeat (coordinator) (increase it proportional to num of tot replicas)
   private static int INTERVAL_HEARTBEAT_UNIT = 500;
@@ -256,13 +259,26 @@ public class Replica extends AbstractActor {
 
   @Override
   public void preStart() {
-
+    //delete previous runs logFile
+    try {
+      if(Files.exists(Paths.get(logFolderPath + File.separator + getSelf().path().name() + "_log.txt"))) {
+        System.out.println("[" + getSelf().path().name() + "] deleting previous runs logfile");
+        Files.delete(Paths.get(logFolderPath + File.separator + getSelf().path().name() + "_log.txt"));
+      }
+    }catch(IOException ioe){
+      System.err.println("[" + getSelf().path().name() + "] IOException while writing in logfile " + Paths.get(getSelf().path().name()+"_log.txt").toAbsolutePath());
+    }
   }
 
   private void sendMessage(ActorRef receiver, GenericMessage msg){
     if(crashed == CrashStatus.CRASHED)//don't answer to msg if state is crashed
       return;
 
+    if(msg.getClass() ==  Response.class){
+
+      System.out.println("[" + getSelf().path().name() + " " + this.clock + "] sending Response msg " +
+              ((Response)msg).v + " to " + receiver.path().name());
+    }
     if(msg.getClass() ==  Update.class){
 
       System.out.println("[" + getSelf().path().name() + " " + this.clock + "] sending UPDATE msg " + ((Update)msg).v + " " +
@@ -373,6 +389,9 @@ public class Replica extends AbstractActor {
     System.out.println("[" + getSelf().path().name() + " " + this.clock + "]" +
             " update " + upd.clock.epoch + ":" + upd.clock.sn + " " + upd.v);
 
+    //write also in log file //Replica <ReplicaID> update <e>:<i> <value>
+    appendLog("Replica " + getSelf().path().name() + " update " + upd.clock + " " + upd.v);
+
     if(!coordinator)//coordinator updates clock when sending update
       this.clock = upd.clock;//others will update their clocks when delivering
 
@@ -380,10 +399,23 @@ public class Replica extends AbstractActor {
     pendingUpdates.remove(upd);
   }
 
+  /*  Append log to logfile
+  * */
+  private void appendLog(String textToAppend){
+    try {
+      if(Files.notExists(Paths.get(logFolderPath)))
+        Files.createDirectory(Paths.get(logFolderPath));
+
+      Files.write(Paths.get(logFolderPath + File.separator + getSelf().path().name()+"_log.txt"), Arrays.asList(textToAppend), StandardCharsets.UTF_8,
+              StandardOpenOption.CREATE, StandardOpenOption.APPEND);  //Append mode
+    }catch(IOException ioe){
+      System.err.println("[" + getSelf().path().name() + " " + this.clock + "] IOException while writing in logfile " + Paths.get(getSelf().path().name()+"_log.txt").toAbsolutePath());
+    }
+  }
+
   /*  Discriminate maximum replica by considering their ids, eg "name1", "name2" where name2 is the maximum
   * */
   private boolean isMaxById(ArrayList<ActorRef> lastUpdateHolders, String prefix){
-    int currentMax = -1;
     int selfId = Integer.parseInt(getSelf().path().name().substring(prefix.length()));
     for(ActorRef actor : lastUpdateHolders) {
       String name = actor.path().name();
@@ -479,9 +511,9 @@ public class Replica extends AbstractActor {
       System.out.println("[" + getSelf().path().name() + " " + this.clock + "] received read request from client " + getSender().path().name());
       sendMessage(sender, new Response(v));//return immediately local value
 
-    }else if(r.rtype == RequestType.WRITE && !coordinator) {//forward write request to coordinator
+    }else if(r.rtype == RequestType.WRITE && !coordinator) {//forward write request to coordinator (if election is not currently running)
       System.out.println("[" + getSelf().path().name() + " " + this.clock + "] received write request from client " + getSender().path().name());
-      if(!election)
+      if(!election)// (if election is not currently running)
         sendMessage(coordinatorRef, r);//forward request to coordinator in normal scenario (aka if the coordinator hasn't crashed)
 
     }else if(r.rtype == RequestType.WRITE && coordinator){//I'm the coordinator, tell other replicas about the update
