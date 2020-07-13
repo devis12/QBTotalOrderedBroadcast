@@ -17,13 +17,13 @@ import java.util.concurrent.TimeUnit;
 // The Replica actor
 public class Replica extends AbstractActor {
 
-  //interval to generate heartbeat (coordinator)
-  private static int INTERVAL_HEARTBEAT = 1500;
-  //interval at which replica expects heartbeat
-  private static int TIMEOUT_HEARTBEAT = 4500;
+  //interval to generate heartbeat (coordinator) (increase it proportional to num of tot replicas)
+  private static int INTERVAL_HEARTBEAT_UNIT = 500;
+  //interval at which replica expects heartbeat (increase it proportional to num of tot replicas)
+  private static int TIMEOUT_HEARTBEAT_UNIT = 1100;
 
-  //Timeout when expepecting messages in response from coordinator
-  private static int TIMEOUT_MSG = 500;
+  //Timeout when expepecting messages in response from coordinator (increase it proportional to num of tot replicas)
+  private static int TIMEOUT_MSG_UNIT = 125;
   //Max time allowed for link communication delays
   private static int MAX_NETWORK_DELAY = 50;
 
@@ -37,16 +37,31 @@ public class Replica extends AbstractActor {
   public static class HeartBeatNotArrived extends GenericMessage{}
   //replicas notify themselves about the coordinator not replying when it is supposed to (i.e. it's crashed)
   public static class CoordinatorTimeout extends GenericMessage{}
+  //msg for timeout when election has somehow failed
+  public static class ElectionFailedMsg extends GenericMessage{}
 
-  public static enum CrashType {FALSE, GENERAL, UPDATE, WRITEOK, UPDATEREQ, UPDATEACK};
+  public static enum CrashStatus {
+    FALSE, //NOT crashed: for replicas who's correctly working
+    CRASHED, //CRASHED: replicas not responding, neither sending any messages
+    BEFORE_UPDATE, //has to crash before sending update / processing update
+    UPDATE, //has to crash while sending updates (for coordinator)
+    AFTER_UPDATE, //has to crash after sending updates / processing update
+    BEFORE_WRITEOK, //has to crash before sending writeok / processing writeok
+    WRITEOK, //has to crash while sending writeok (for coordinator)
+    AFTER_WRITEOK, //has to crash after sending writeok / processing writeok
+    BEFORE_REQUEST, //crashed just before processing request (for common replica)
+    AFTER_REQUEST, //crashed just after processing request (for common replica)
+    BEFORE_UPDATEACK,//crashed just before processing updateack (for coordinator)
+    AFTER_UPDATEACK //crashed just after processing updateack (for coordinator)
+  };
   /*tells a replica (or the coordinator) to enter crash mode before doing a specific action (if specified)
   FALSE: the replica is still active | GENERAL: crash immediately | UDPDATE: crash the next time you have to forward an UPDATE msg 
   WRITEOK: crash the next time you have to send the WRITEOK msg | and so on...
   */
   public static class CrashMsg extends GenericMessage{
-    public final CrashType ctype;
+    public final CrashStatus ctype;
     
-    public CrashMsg(CrashType ctype){
+    public CrashMsg(CrashStatus ctype){
       this.ctype = ctype;
     }
   }
@@ -160,9 +175,11 @@ public class Replica extends AbstractActor {
 
   // Election message to be sent to next replica up
   public static class ElectionMsg extends GenericMessage{
+    public final int electionEpoch;
     public final Update lastUpdate;
     public final ArrayList<ActorRef> lastUpdateHolders;
-    public ElectionMsg(Update lastUpdate, ArrayList<ActorRef> lastUpdateHolders){
+    public ElectionMsg(int electionEpoch, Update lastUpdate, ArrayList<ActorRef> lastUpdateHolders){
+      this.electionEpoch = electionEpoch;
       this.lastUpdate = lastUpdate;
       this.lastUpdateHolders = lastUpdateHolders;
     }
@@ -172,10 +189,10 @@ public class Replica extends AbstractActor {
   public static class ElectionMsgACK extends GenericMessage{}
 
   // Election message to be sent to next replica up
-  public static class ElectionACKTimeout extends GenericMessage{
+  public static class ElectionMsgACKTimeout extends GenericMessage{
     public final ActorRef receivingReplica;
     public final ElectionMsg electionMsg;
-    public ElectionACKTimeout(ActorRef receivingReplica, ElectionMsg electionMsg){
+    public ElectionMsgACKTimeout(ActorRef receivingReplica, ElectionMsg electionMsg){
       this.receivingReplica = receivingReplica;
       this.electionMsg = electionMsg;
     }
@@ -183,9 +200,11 @@ public class Replica extends AbstractActor {
 
   // Synchronization message to terminate election
   public static class SynchronizationMsg extends GenericMessage{
+    public final int electionEpoch;
     public final ActorRef newCoordinator;
     public final Update updToBePerformed;
-    public SynchronizationMsg(ActorRef newCoordinator, Update updToBePerformed){
+    public SynchronizationMsg(int electionEpoch, ActorRef newCoordinator, Update updToBePerformed){
+      this.electionEpoch = electionEpoch;
       this.newCoordinator = newCoordinator;
       this.updToBePerformed = updToBePerformed;
     }
@@ -204,6 +223,8 @@ public class Replica extends AbstractActor {
   private HashMap<Update, Cancellable> timersUpdateACK = new HashMap<>();
   // to timeout during election process if not receiving ACK from following replica
   private Cancellable timerElectionMsg;
+  // to timeout during election process if election doesn't come to an end (e.g. caused by crashing of neighbouring nodes)
+  private Cancellable timerElectionFailed;
   // is the replica a coordinator
   private boolean coordinator;
   //hashmap containing number of ack received for a given update 
@@ -213,15 +234,19 @@ public class Replica extends AbstractActor {
   //local time wrt this replica, which consists in epoch+sequence number
   private LocalTime clock;
   //has the replica crashed? (general crash)
-  private CrashType crashed;
+  private CrashStatus crashed;
   //election process in progress
   private boolean election;
+  //synchronization process in progress
+  private boolean synchronization;
 
   public Replica(int v, boolean coordinator){
     this.v = v;
     this.coordinator = coordinator;
     clock = new LocalTime(0,0);
-    crashed = CrashType.FALSE; //by default the replica is active (in a non-crashed state)
+    crashed = CrashStatus.FALSE; //by default the replica is active (in a non-crashed state)
+    election = false;
+    synchronization = false;
   }
 
   // Some stuff required by Akka to create actors of this type
@@ -231,41 +256,26 @@ public class Replica extends AbstractActor {
 
   @Override
   public void preStart() {
-    System.out.println("Starting heartbeat process");
-    if(coordinator)
-      timerHeartBeat = initTimeout(INTERVAL_HEARTBEAT, INTERVAL_HEARTBEAT, new SendHeartBeat());
 
-    else
-      timerHeartBeat = initTimeout(TIMEOUT_HEARTBEAT, TIMEOUT_HEARTBEAT, new HeartBeatNotArrived());
   }
 
   private void sendMessage(ActorRef receiver, GenericMessage msg){
-    if(crashed == CrashType.GENERAL)//don't answer to msg if state is crashed
+    if(crashed == CrashStatus.CRASHED)//don't answer to msg if state is crashed
       return;
 
     if(msg.getClass() ==  Update.class){
-      if(crashed == CrashType.UPDATE){
-        crashed = CrashType.GENERAL; //after specific crash, transform it into a general one
-        return;
-      }
-      
-      System.out.println(getSelf().path().name() + " sending UPDATE msg " + ((Update)msg).v + " " +
+
+      System.out.println("[" + getSelf().path().name() + " " + this.clock + "] sending UPDATE msg " + ((Update)msg).v + " " +
               ((Update)msg).clock.epoch + "-" + ((Update)msg).clock.sn + " to " + receiver.path().name());
     }
     if(msg.getClass() ==  UpdateACK.class){
-      if(crashed == CrashType.UPDATEACK){
-        crashed = CrashType.GENERAL; //after specific crash, transform it into a general one
-        return;
-      }
-      System.out.println(getSelf().path().name() + " sending UPDATEACK msg " + ((UpdateACK)msg).v + " " +
+
+      System.out.println("[" + getSelf().path().name() + " " + this.clock + "] sending UPDATEACK msg " + ((UpdateACK)msg).v + " " +
               ((UpdateACK)msg).clock.epoch + "-" + ((UpdateACK)msg).clock.sn + " to " + receiver.path().name());
     }
     if(msg.getClass() == WriteOK.class){
-      if(crashed == CrashType.WRITEOK){
-        crashed = CrashType.GENERAL; //after specific crash, transform it into a general one
-        return;
-      }
-      System.out.println(getSelf().path().name() + " sending WRITEOK msg " + ((WriteOK)msg).v + " " +
+
+      System.out.println("[" + getSelf().path().name() + " " + this.clock + "] sending WRITEOK msg " + ((WriteOK)msg).v + " " +
               ((WriteOK)msg).clock.epoch + "-" + ((WriteOK)msg).clock.sn + " to " + receiver.path().name());
     }
     //try{Thread.sleep(2000);}catch(Exception e){}
@@ -280,23 +290,25 @@ public class Replica extends AbstractActor {
   /*  If broadcast equals true send also to itself
   * */
   private void multicastMessageToReplicas(GenericMessage msg, boolean broadcast){
-    if(crashed == CrashType.GENERAL)//don't answer to msg if state is crashed
+    if(crashed == CrashStatus.CRASHED)//don't answer to msg if state is crashed
       return;
 
     if(msg.getClass() == Update.class){
-      if(crashed == CrashType.UPDATE){
-        crashed = CrashType.GENERAL; //after specific crash, transform it into a general one
+
+      if(crashed == CrashStatus.BEFORE_UPDATE){//coordinator is asked to crash before update
+        crashed = CrashStatus.CRASHED; //after specific crash, transform it into a general one
         return;
-      }   
-      System.out.println(getSelf().path().name() + " multicasting UPDATE msg " + ((Update)msg).v + " " +
+      }
+
+      System.out.println("[" + getSelf().path().name() + " " + this.clock + "] multicasting UPDATE msg " + ((Update)msg).v + " " +
               ((Update)msg).clock.epoch + "-" + ((Update)msg).clock.sn);
     }
     if(msg.getClass() == WriteOK.class){
-      if(crashed == CrashType.WRITEOK){
-        crashed = CrashType.GENERAL; //after specific crash, transform it into a general one
+      if(crashed == CrashStatus.BEFORE_WRITEOK){//coordinator is asked to crash before writeOK
+        crashed = CrashStatus.CRASHED; //after specific crash, transform it into a general one
         return;
       }
-      System.out.println(getSelf().path().name() + " multicasting WRITEOK msg " + ((WriteOK)msg).v + " " +
+      System.out.println("[" + getSelf().path().name() + " " + this.clock + "] multicasting WRITEOK msg " + ((WriteOK)msg).v + " " +
               ((WriteOK)msg).clock.epoch + "-" + ((WriteOK)msg).clock.sn);
     }
     
@@ -305,10 +317,32 @@ public class Replica extends AbstractActor {
     Collections.shuffle(shuffledGroup);
 
     // multicast to all peers in the group
-    for (ActorRef r: shuffledGroup)
-      if(broadcast || !r.equals(getSelf()))//avoid sending to yourself in multicast
+    for (ActorRef r: shuffledGroup) {
+      if (broadcast || !r.equals(getSelf()))//avoid sending to yourself in multicast
         sendMessage(r, msg);
-    
+
+      if(msg.getClass() == Update.class && crashed == CrashStatus.UPDATE){//crash randomly during update)
+        if(new Random(System.currentTimeMillis()).nextInt(2) % 2 == 0){
+          crashed = CrashStatus.CRASHED; //after specific crash, transform it into a general one
+          return;
+        }
+      }
+
+      if(msg.getClass() == WriteOK.class && crashed == CrashStatus.WRITEOK){//crash randomly during update)
+        if(new Random(System.currentTimeMillis()).nextInt(2) % 2 == 0){
+          crashed = CrashStatus.CRASHED; //after specific crash, transform it into a general one
+          return;
+        }
+      }
+
+    }
+
+    if(msg.getClass() == Update.class && crashed == CrashStatus.AFTER_UPDATE)//coordinator is asked to crash after writeOK
+      crashed = CrashStatus.CRASHED; //after specific crash, transform it into a general one
+
+    if(msg.getClass() == WriteOK.class && crashed == CrashStatus.AFTER_WRITEOK)
+      crashed = CrashStatus.CRASHED; //after specific crash, transform it into a general one
+
   }
 
   private Cancellable initTimeout(int startTime, int intervalTime, GenericMessage msg){
@@ -336,8 +370,12 @@ public class Replica extends AbstractActor {
   private void deliver(Update upd){
     //perforn update
     this.v = upd.v;
-    System.out.println("Replica " + getSelf().path().name() +
+    System.out.println("[" + getSelf().path().name() + " " + this.clock + "]" +
             " update " + upd.clock.epoch + ":" + upd.clock.sn + " " + upd.v);
+
+    if(!coordinator)//coordinator updates clock when sending update
+      this.clock = upd.clock;//others will update their clocks when delivering
+
     //delete from pending updates list
     pendingUpdates.remove(upd);
   }
@@ -375,9 +413,13 @@ public class Replica extends AbstractActor {
   /*  Start election process after coordinator's failure detection
   * */
   private void initiateElection() {
-    if(election)
+    if(election)//to avoid to init election, when one is already running
       return;
-    System.out.println("["+getSelf().path().name()+"] initiating election");
+
+    //election is supposed to end after a while, otherwise something bad has happened
+    timerElectionFailed = initTimeout((TIMEOUT_MSG_UNIT*replicas.size())*replicas.size(),(TIMEOUT_MSG_UNIT*replicas.size())*replicas.size(), new ElectionFailedMsg());
+
+    System.out.println("[" + getSelf().path().name() + " " + this.clock + "] initiating election");
     election = true;
     //send election message
     ActorRef receivingReplica = selectNextReplica(getSelf(), true);
@@ -385,28 +427,38 @@ public class Replica extends AbstractActor {
     lastUpdateHolders.add(getSelf());
     ElectionMsg newElectionMsg = null;
     if(pendingUpdates.size() > 0)//pick your last update to forward on if there is any
-      newElectionMsg = new ElectionMsg(pendingUpdates.getLast(), lastUpdateHolders);
+      newElectionMsg = new ElectionMsg(clock.epoch, pendingUpdates.getLast(), lastUpdateHolders);
     else
-      newElectionMsg = new ElectionMsg(null, lastUpdateHolders);
+      newElectionMsg = new ElectionMsg(clock.epoch,null, lastUpdateHolders);
     sendMessage(receivingReplica, newElectionMsg);
 
-    timerElectionMsg = initTimeout(TIMEOUT_MSG, TIMEOUT_MSG,new ElectionACKTimeout(receivingReplica, newElectionMsg));
+    timerElectionMsg = initTimeout(TIMEOUT_MSG_UNIT * replicas.size(), TIMEOUT_MSG_UNIT * replicas.size(),new ElectionMsgACKTimeout(receivingReplica, newElectionMsg));
   }
 
   /*  Terminate election process by broadcasting to all, that youp're the new coordinator
   * */
   private void synchronization(){
-    System.out.println("["+getSelf().path().name()+"] initiating synchronization to terminate election");
+    if(synchronization)//already in synch mode
+      return;
+    synchronization = true;
+    System.out.println("[" + getSelf().path().name() + " " + this.clock + "] initiating synchronization to terminate election");
     Update pendingUpdate = (pendingUpdates.isEmpty())? null : pendingUpdates.getLast();
-    multicastMessageToReplicas(new SynchronizationMsg(getSelf(), pendingUpdate), true);
+    multicastMessageToReplicas(new SynchronizationMsg(this.clock.epoch, getSelf(), pendingUpdate), true);
   }
 
   private void onJoinGroupMsg(JoinGroupMsg msg) {
-    if(crashed == CrashType.GENERAL)//don't answer to msg if state is crashed
+    if(crashed == CrashStatus.CRASHED)//don't answer to msg if state is crashed
       return;
 
     this.replicas = msg.group;
     this.coordinatorRef = msg.coordinatorRef;
+
+    System.out.println("Starting heartbeat process");
+    if(coordinator)
+      timerHeartBeat = initTimeout(INTERVAL_HEARTBEAT_UNIT * replicas.size(), INTERVAL_HEARTBEAT_UNIT * replicas.size(), new SendHeartBeat());
+
+    else
+      timerHeartBeat = initTimeout(TIMEOUT_HEARTBEAT_UNIT * replicas.size(), TIMEOUT_HEARTBEAT_UNIT * replicas.size(), new HeartBeatNotArrived());
   }
 
   /*  Need to enter in crashed mode
@@ -417,45 +469,58 @@ public class Replica extends AbstractActor {
 
   // Here we define our reaction on the received Request (read/write) messages
   private void onRequest(Request r) {
-    if(crashed == CrashType.GENERAL)//don't answer to msg if state is crashed
+    if(crashed == CrashStatus.CRASHED || crashed == CrashStatus.BEFORE_REQUEST) {//don't answer to msg if state is crashed or has to be crashed
+      crashed = CrashStatus.CRASHED;//just say it is crashed to avoid answering/sending any future message
       return;
+    }
 
     ActorRef sender = r.client;
     if(r.rtype == RequestType.READ) {
-      System.out.println( "<"+ getSelf().path().name()+ "> received read request from client " + getSender().path().name());
+      System.out.println("[" + getSelf().path().name() + " " + this.clock + "] received read request from client " + getSender().path().name());
       sendMessage(sender, new Response(v));//return immediately local value
 
     }else if(r.rtype == RequestType.WRITE && !coordinator) {//forward write request to coordinator
-      System.out.println( "<"+ getSelf().path().name()+ "> received write request from client " + getSender().path().name());
+      System.out.println("[" + getSelf().path().name() + " " + this.clock + "] received write request from client " + getSender().path().name());
       if(!election)
         sendMessage(coordinatorRef, r);//forward request to coordinator in normal scenario (aka if the coordinator hasn't crashed)
 
     }else if(r.rtype == RequestType.WRITE && coordinator){//I'm the coordinator, tell other replicas about the update
-      System.out.println( "<"+ getSelf().path().name()+ "> received write request from client " + getSender().path().name());
-      clock = LocalTime.newSequence(clock);//update clock
+      System.out.println("[" + getSelf().path().name() + " " + this.clock + "] received write request from client " + getSender().path().name());
+      this.clock = LocalTime.newSequence(clock);//update clock
       multicastMessageToReplicas(new Update(clock, r.v), true);
     }
+
+    if(crashed == CrashStatus.AFTER_REQUEST)//state has to be crashed NOW
+      crashed = CrashStatus.CRASHED;//just say it is crashed to avoid answering/sending any future message
+
 
   }
 
   // Here we define our reaction on the received Update messages
   private void onUpdate(Update upd) {
-    if(crashed == CrashType.GENERAL)//don't answer to msg if state is crashed
+    if(crashed == CrashStatus.CRASHED || crashed == CrashStatus.BEFORE_UPDATE) {//don't answer to msg if state is crashed or has to be crashed
+      crashed = CrashStatus.CRASHED;//just say it is crashed to avoid answering/sending any future message
       return;
+    }
 
     pendingUpdates.addLast(upd);//add to pending updates to be performed
     for(Update pupd:pendingUpdates)
-      System.out.println("<" + getSelf().path().name() + "> pending update: " + pupd.v + " " + pupd.clock.epoch + "-" + pupd.clock.sn);
+      System.out.println("[" + getSelf().path().name() + " " + this.clock + "] pending update: " + pupd.v + " " + pupd.clock.epoch + "-" + pupd.clock.sn);
 
     sendMessage(coordinatorRef, new UpdateACK(upd.clock, upd.v));
     //start timer to detect coordinator failure while waiting for writeOK of this update
-    timersUpdateACK.put(upd, initTimeout(TIMEOUT_MSG, TIMEOUT_MSG, new CoordinatorTimeout()));
+    timersUpdateACK.put(upd, initTimeout(TIMEOUT_MSG_UNIT * replicas.size(), TIMEOUT_MSG_UNIT * replicas.size(), new CoordinatorTimeout()));
+
+    if(crashed == CrashStatus.AFTER_UPDATE)//state has to be crashed NOW
+      crashed = CrashStatus.CRASHED;//just say it is crashed to avoid answering/sending any future message
   }
 
   // Here we define our reaction on the received UpdateACK messages
   private void onUpdateACK(UpdateACK upd) {
-    if(crashed == CrashType.GENERAL)//don't answer to msg if state is crashed
+    if(crashed == CrashStatus.CRASHED || crashed == CrashStatus.BEFORE_UPDATEACK) {//don't answer to msg if state is crashed or has to be crashed
+      crashed = CrashStatus.CRASHED;//just say it is crashed to avoid answering/sending any future message
       return;
+    }
 
     //Update hashmap of clock, acks
     Integer acksReceived = ackMap.get(upd.clock);
@@ -472,12 +537,17 @@ public class Replica extends AbstractActor {
       multicastMessageToReplicas(new WriteOK(upd.clock, upd.v), true);
     }
 
+    if(crashed == CrashStatus.AFTER_UPDATEACK)//state has to be crashed NOW
+      crashed = CrashStatus.CRASHED;//just say it is crashed to avoid answering/sending any future message
+
   }
 
   // Here we define our reaction on the received WriteOK messages, i.e. perform update
   private void onWriteOK(WriteOK wokUpd) {
-    if(crashed == CrashType.GENERAL)//don't answer to msg if state is crashed
+    if(crashed == CrashStatus.CRASHED || crashed == CrashStatus.BEFORE_WRITEOK) {//don't answer to msg if state is crashed or has to be crashed
+      crashed = CrashStatus.CRASHED;//just say it is crashed to avoid answering/sending any future message
       return;
+    }
 
     Update confirmedUpdate = Update.toUpdate(wokUpd);
 
@@ -504,18 +574,22 @@ public class Replica extends AbstractActor {
       }
     }
 
+    if(crashed == CrashStatus.AFTER_WRITEOK)//state has to be crashed NOW
+      crashed = CrashStatus.CRASHED;//just say it is crashed to avoid answering/sending any future message
+
   }
 
   /*  Coordinator heartbeat to signal the fact that it is still up
   * */
   private void onCoordinatorHeartBeat(CoordinatorHeartBeat msg) {
-    if(crashed == CrashType.GENERAL)//don't answer to msg if state is crashed
+    if(crashed == CrashStatus.CRASHED)//don't answer to msg if state is crashed
       return;
-    System.out.println("" + getSelf().path().name() + " received heartbeat from coordinator");
+
+    System.out.println("[" + getSelf().path().name() + " " + this.clock + "] received heartbeat from coordinator");
 
     if(!coordinator){
       timerHeartBeat.cancel();
-      timerHeartBeat = initTimeout(TIMEOUT_HEARTBEAT, TIMEOUT_HEARTBEAT, new HeartBeatNotArrived());
+      timerHeartBeat = initTimeout(TIMEOUT_HEARTBEAT_UNIT * replicas.size(), TIMEOUT_HEARTBEAT_UNIT * replicas.size(), new HeartBeatNotArrived());
     }
 
   }
@@ -523,7 +597,7 @@ public class Replica extends AbstractActor {
   /*  replicas notify themselves about the coordinator heartbeat not arrived
    * */
   private void onHeartBeatNotArrived(HeartBeatNotArrived msg) {
-    if(crashed == CrashType.GENERAL)//don't answer to msg if state is crashed
+    if(crashed == CrashStatus.CRASHED)//don't answer to msg if state is crashed
       return;
 
     System.out.println("FAILURE OF THE COORDINATOR: heartbeat not arrived");
@@ -541,9 +615,9 @@ public class Replica extends AbstractActor {
   /*  Coordinator heartbeat to signal the fact that it is still up
    * */
   private void onSendHeartBeat(SendHeartBeat msg) {
-    if(crashed == CrashType.GENERAL)//don't answer to msg if state is crashed
+    if(crashed == CrashStatus.CRASHED)//don't answer to msg if state is crashed
       return;
-    System.out.println("" + getSelf().path().name() + ", aka coordinator sending heartbeats to everyone");
+    System.out.println("[" + getSelf().path().name() + " " + this.clock + "], aka coordinator sending heartbeats to everyone");
 
     multicastMessageToReplicas(new CoordinatorHeartBeat(), false);
   }
@@ -551,10 +625,17 @@ public class Replica extends AbstractActor {
   /* Manage incoming electionmsg
   */
   private void onElectionMsg(ElectionMsg msg) {
-    if(crashed == CrashType.GENERAL)//don't answer to msg if state is crashed
+    if(crashed == CrashStatus.CRASHED)//don't answer to msg if state is crashed
       return;
-    
-    System.out.println("[" + getSelf().path().name() + "] received election msg from " + getSender().path().name());
+
+    if(!election)//this msg has been stating the start of the election, which is supposed to end after a while, otherwise something bad has happened
+      timerElectionFailed = initTimeout((TIMEOUT_MSG_UNIT*replicas.size())*replicas.size(),(TIMEOUT_MSG_UNIT*replicas.size())*replicas.size(), new ElectionFailedMsg());
+
+    //if epoch in which election is running is greater (i.e. synch already done), this election msg need to be ignored
+    if(clock.epoch > msg.electionEpoch)
+      return;
+
+    System.out.println("[" + getSelf().path().name() + " " + this.clock + "] received election msg from " + getSender().path().name() + "(electionEpoch:"+msg.electionEpoch+")");
     election = true;// in case this replica is not already in election mode (e.g. coordinator's timeout detected by someone else)
 
     sendMessage(getSender(), new ElectionMsgACK());//ack of election msg
@@ -562,31 +643,31 @@ public class Replica extends AbstractActor {
     ActorRef receivingReplica = selectNextReplica(getSelf(), true);
     ElectionMsg newElectionmsg;
 
-
     if (msg.lastUpdateHolders.contains(getSelf())){
       if(isMaxById(msg.lastUpdateHolders, "replica")){ //election msg has already performed a round and this replica is the best candidate (disambiguate by id, take the maximum)
-        System.out.println("["+getSelf().path().name()+"] BEFORE initiating synchronization, best between " + msg.lastUpdateHolders.size() + " candidates");
-        synchronization();//broadcast to everyone you're the new coordinator
+        if(!synchronization)
+          synchronization();//broadcast to everyone you're the new coordinator
         
       }else{//just pass along msg, election has converged, but you're not the best candidate
         newElectionmsg = msg;
         sendMessage(receivingReplica, newElectionmsg);
 
-        timerElectionMsg = initTimeout(TIMEOUT_MSG, TIMEOUT_MSG,new ElectionACKTimeout(receivingReplica, newElectionmsg));
+        timerElectionMsg = initTimeout(TIMEOUT_MSG_UNIT * replicas.size(), TIMEOUT_MSG_UNIT * replicas.size(),new ElectionMsgACKTimeout(receivingReplica, newElectionmsg));
       }
+
     }else{
+
       if(pendingUpdates.isEmpty() && msg.lastUpdate == null) {//no pending update is circulating until now and this replica hasn't any
-        System.out.println("[" + getSelf().path().name() + "] has literally 0 pending updates");
         ArrayList<ActorRef> lastUpdateHolders = msg.lastUpdateHolders;
         lastUpdateHolders.add(getSelf());
-        newElectionmsg = new ElectionMsg(null, lastUpdateHolders);
+        newElectionmsg = new ElectionMsg(clock.epoch, null, lastUpdateHolders);
 
       }else if(pendingUpdates.size() > 0 && msg.lastUpdate == null) {//mine considered to be the more recent update, since there is none in the election msg
         //NOTE considered this also as the case in which the WRITEOK has just reached some replicas and not all, thus this can be considered as an old update by other replicas
         //TODO handle unfinished update, i.e. case in which WRITEOK has not reached everyone... this can be also considered as a last update to repeat to everyone and things would still be okay (I think...)
         ArrayList<ActorRef> lastUpdateHolders = new ArrayList<>();
         lastUpdateHolders.add(getSelf());
-        newElectionmsg = new ElectionMsg(pendingUpdates.getLast(), lastUpdateHolders);
+        newElectionmsg = new ElectionMsg(clock.epoch, pendingUpdates.getLast(), lastUpdateHolders);
 
       }else if(pendingUpdates.size() > 0 && (msg.lastUpdate.moreRecent(pendingUpdates.getLast()))) {//this replica has pending updates and its last pending upd is not more recent than the one inside the election msg
         newElectionmsg = msg;//just forward election msg
@@ -594,17 +675,17 @@ public class Replica extends AbstractActor {
       }else if(msg.lastUpdate.equals(pendingUpdates.getLast())) {//last pending update equals to the one in this replica,add itself between best candidates
         ArrayList<ActorRef> lastUpdateHolders = msg.lastUpdateHolders;
         lastUpdateHolders.add(getSelf());
-        newElectionmsg = new ElectionMsg(pendingUpdates.getLast(), lastUpdateHolders);
+        newElectionmsg = new ElectionMsg(clock.epoch, pendingUpdates.getLast(), lastUpdateHolders);
 
       }else { //my update is more recent one, update election msg before forwarding
         ArrayList<ActorRef> lastUpdateHolders = new ArrayList<>();
         lastUpdateHolders.add(getSelf());
-        newElectionmsg = new ElectionMsg(pendingUpdates.getLast(), lastUpdateHolders);
+        newElectionmsg = new ElectionMsg(clock.epoch, pendingUpdates.getLast(), lastUpdateHolders);
       }
 
       sendMessage(receivingReplica, newElectionmsg);
 
-      timerElectionMsg = initTimeout(TIMEOUT_MSG, TIMEOUT_MSG,new ElectionACKTimeout(receivingReplica, newElectionmsg));
+      timerElectionMsg = initTimeout(TIMEOUT_MSG_UNIT * replicas.size(), TIMEOUT_MSG_UNIT * replicas.size(),new ElectionMsgACKTimeout(receivingReplica, newElectionmsg));
 
     }
   }
@@ -612,59 +693,88 @@ public class Replica extends AbstractActor {
   /*  Received ack from following replica during election process
   * */
   private void onElectionMsgACK(ElectionMsgACK msg) {
-    if(crashed == CrashType.GENERAL || !election)//don't answer to msg if state is crashed
+    if(crashed == CrashStatus.CRASHED || !election)//don't answer to msg if state is crashed or if election has came to conclusion
       return;
-    System.out.println("["+getSelf().path().name()+"] received ACK from " + getSender().path().name() + " during election");
+
+    System.out.println("[" + getSelf().path().name() + " " + this.clock + "] received ACK from " + getSender().path().name() + " during election");
     //cancel timeout for election msg ack
     timerElectionMsg.cancel();
   }
 
   /*  Following replica seems to have failed as well, forward to next one
   * */
-  private void onElectionACKTimeout(ElectionACKTimeout msg) {
-    if(crashed == CrashType.GENERAL || !election)//don't answer to msg if state is crashed
+  private void onElectionMsgACKTimeout(ElectionMsgACKTimeout msg) {
+    if(msg.electionMsg.electionEpoch < this.clock.epoch) {//this election msg ack was in any case obsolete
+      if(timerElectionFailed != null)//make sure the timeout is not valid anymore
+        timerElectionFailed.cancel();
+
+      election = false;
+    }
+
+    if(crashed == CrashStatus.CRASHED || !election)//don't answer to msg if state is crashed or if election has came to conclusion
       return;
 
-    System.out.println("["+getSelf().path().name()+"] not received ACK from " + msg.receivingReplica.path().name() + " during election");
+    System.out.println("[" + getSelf().path().name() + " " + this.clock + "] not received ACK from " + msg.receivingReplica.path().name() + " during election");
     //send election message to next replica wrt the one that didn't answer causing this timeout
     ActorRef receivingReplica = selectNextReplica(msg.receivingReplica, true);
     sendMessage(receivingReplica, msg.electionMsg);
 
     timerElectionMsg.cancel();
-    timerElectionMsg = initTimeout(TIMEOUT_MSG, TIMEOUT_MSG,new ElectionACKTimeout(receivingReplica, msg.electionMsg));
+    timerElectionMsg = initTimeout(TIMEOUT_MSG_UNIT * replicas.size(), TIMEOUT_MSG_UNIT * replicas.size(),new ElectionMsgACKTimeout(receivingReplica, msg.electionMsg));
   }
 
   /*  Received synchronization msg as result of convergence in election protocol
    * */
   private void onSynchronizationMsg(SynchronizationMsg msg) {
-    if(crashed == CrashType.GENERAL || !election)//don't answer to msg if state is crashed
+    if(msg.electionEpoch < this.clock.epoch) {//this election msg ack was in any case obsolete
+      if(timerElectionFailed != null)//make sure the timeout is not valid anymore
+        timerElectionFailed.cancel();
+
+      election = false;
+    }
+
+    if(crashed == CrashStatus.CRASHED || !election)//don't answer to msg if state is crashed or if election has came to conclusion
       return;
 
+    timerElectionFailed.cancel();//election has not failed
     election = false;//election mode terminated
-    System.out.println("["+getSelf().path().name()+"] received synchronization msg from " + getSender().path().name());
+
+    System.out.println("[" + getSelf().path().name() + " " + this.clock + "] received synchronization msg from " + getSender().path().name());
 
     if(msg.newCoordinator == getSelf()) {
       //current replica is the new coordinator
       coordinator = true;
       coordinatorRef = getSelf();
-      timerHeartBeat = initTimeout(INTERVAL_HEARTBEAT, INTERVAL_HEARTBEAT, new SendHeartBeat());//as new coordinator, send heartbeats regularly
+      timerHeartBeat = initTimeout(INTERVAL_HEARTBEAT_UNIT * replicas.size(), INTERVAL_HEARTBEAT_UNIT * replicas.size(), new SendHeartBeat());//as new coordinator, send heartbeats regularly
 
     }else{
       //update coordinator info
       coordinator = false;
       coordinatorRef = msg.newCoordinator;
-      timerHeartBeat = initTimeout(TIMEOUT_HEARTBEAT, TIMEOUT_HEARTBEAT, new HeartBeatNotArrived());//expects heartbeats from new coordinator
+      timerHeartBeat = initTimeout(TIMEOUT_HEARTBEAT_UNIT * replicas.size(), TIMEOUT_HEARTBEAT_UNIT * replicas.size(), new HeartBeatNotArrived());//expects heartbeats from new coordinator
 
     }
 
     //perform last pending update of current epoch, before starting a new one
-    if(msg.updToBePerformed != null) {
+    if(msg.updToBePerformed != null)
       this.v = msg.updToBePerformed.v;
-      this.clock = new LocalTime(msg.updToBePerformed.clock.epoch + 1, 0);
-    }
+
+    //update clock
+    this.clock = new LocalTime(msg.electionEpoch + 1, 0);
 
     //cleanup pending updates of previous epochs because they're obsolete now
     pendingUpdates.clear();
+
+    synchronization = false;//synchronization mode is came to an end
+  }
+
+  /* Manage election failure
+   */
+  private void onElectionFailedMsg(ElectionFailedMsg msg) {
+    timerElectionFailed.cancel();
+    System.out.println("[" + getSelf().path().name() + " " + this.clock + "] received synchronization msg from " + getSender().path().name());
+    election = false;
+    initiateElection();//restart new election
   }
 
 
@@ -681,8 +791,9 @@ public class Replica extends AbstractActor {
       .match(SendHeartBeat.class, this::onSendHeartBeat)
       .match(ElectionMsg.class, this::onElectionMsg)
       .match(ElectionMsgACK.class, this::onElectionMsgACK)
-      .match(ElectionACKTimeout.class, this::onElectionACKTimeout)
+      .match(ElectionMsgACKTimeout.class, this::onElectionMsgACKTimeout)
       .match(SynchronizationMsg.class, this::onSynchronizationMsg)
+      .match(ElectionFailedMsg.class, this::onElectionFailedMsg)
       .match(Request.class, this::onRequest)
       .match(Update.class, this::onUpdate)
       .match(UpdateACK.class, this::onUpdateACK)

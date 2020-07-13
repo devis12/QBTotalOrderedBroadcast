@@ -39,4 +39,9 @@ public final class LocalTime implements Serializable{
         hash = 53 * hash + this.sn;
         return hash;
     }
+
+    @Override
+    public String toString(){
+        return "(" +this.epoch + "-" + this.sn  + ")";
+    }
 }
