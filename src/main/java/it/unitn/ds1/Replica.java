@@ -353,10 +353,12 @@ public class Replica extends AbstractActor {
 
     }
 
-    if(msg.getClass() == Update.class && crashed == CrashStatus.AFTER_UPDATE)//coordinator is asked to crash after writeOK
+    //coordinator is asked to crash after update, if it hasn't crashed during the update, make it crash
+    if(msg.getClass() == Update.class && (crashed == CrashStatus.AFTER_UPDATE || crashed == CrashStatus.UPDATE))
       crashed = CrashStatus.CRASHED; //after specific crash, transform it into a general one
-
-    if(msg.getClass() == WriteOK.class && crashed == CrashStatus.AFTER_WRITEOK)
+    
+    //coordinator is asked to crash after writeok, if it hasn't crashed during the writeok sending, make it crash
+    if(msg.getClass() == WriteOK.class && (crashed == CrashStatus.AFTER_WRITEOK || crashed == CrashStatus.WRITEOK))
       crashed = CrashStatus.CRASHED; //after specific crash, transform it into a general one
 
   }

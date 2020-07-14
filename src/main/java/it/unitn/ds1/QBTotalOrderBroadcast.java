@@ -16,7 +16,7 @@ import it.unitn.ds1.Client.SendWriteRequest;
 
 public class QBTotalOrderBroadcast {
 
-  final static int N_REPLICAS = 4;
+  final static int N_REPLICAS = 7;
   final static int N_CLIENTS = 2;
   final static int INIT_V = 16;
 
@@ -64,14 +64,16 @@ public class QBTotalOrderBroadcast {
     */
     clients.get(0).tell(new SendReadRequest(), null);
     clients.get(0).tell(new SendWriteRequest(5), null);
+    replicas.get(1).tell(new CrashMsg(Replica.CrashStatus.BEFORE_REQUEST), null);
     clients.get(1).tell(new SendWriteRequest(2), null);
+    replicas.get(1).tell(new CrashMsg(Replica.CrashStatus.CRASHED), null);
     Thread.sleep(260);
     clients.get(1).tell(new SendReadRequest(), null);
     Thread.sleep(1200);
     clients.get(0).tell(new SendWriteRequest(17), null);
     clients.get(0).tell(new SendWriteRequest(18), null);
     clients.get(1).tell(new SendWriteRequest(19), null);
-    replicas.get(3).tell(new CrashMsg(Replica.CrashStatus.CRASHED), null);//make the coordinator crash
+    replicas.get(6).tell(new CrashMsg(Replica.CrashStatus.CRASHED), null);//make the coordinator crash
     clients.get(0).tell(new SendWriteRequest(20), null);
     clients.get(1).tell(new SendWriteRequest(22), null);
     clients.get(1).tell(new SendReadRequest(), null);

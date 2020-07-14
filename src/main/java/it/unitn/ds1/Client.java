@@ -125,9 +125,9 @@ public class Client extends AbstractActor {
     appendLog("Client " + getSelf().path().name() + " read done " + r.v);
   }
 
-  //Method to trigger from externally the client to perform a read
+  //Method to trigger externally wrt the client to perform a read
   private void onSendReadRequest(SendReadRequest msg) {
-    ActorRef replica = selectRandomReplica();
+    ActorRef replica = selectRandomReplica(); //read from a random replica
     System.out.println("["+getSelf().path().name()+"] ready to make a read request");
     //log  Client <ClientID> read req to <ReplicaID>
     appendLog("Client " + getSelf().path().name() + " read req to " + replica.path().name());
@@ -144,14 +144,12 @@ public class Client extends AbstractActor {
     );
   }
 
-  //Method to trigger from externally the client to perform a write
   private void onSendWriteRequest(SendWriteRequest msg) {
     ActorRef replica = selectRandomReplica();
     System.out.println(""+getSelf().path().name()+" ready to make a write request");
     replica.tell(new Request(getSelf(), RequestType.WRITE, msg.v), getSelf());
   }
 
-  //Method to trigger from externally the client to perform a write
   private void onTimeoutRead(TimeoutReadMsg msg) {
     timeoutRead.cancel();//timeout has served its purpose
     System.out.println("["+getSelf().path().name()+"] read request has FAILED!");
