@@ -62,13 +62,13 @@ public class QBTotalOrderBroadcast {
        #           ACTIONS CONTROL LIST              #
        ###############################################
     */
-    replicas.get(6).tell(new CrashMsg(CrashStatus.AFTER_UPDATE), null);
+    
     clients.get(0).tell(new SendWriteRequest(8), null);
     clients.get(1).tell(new SendWriteRequest(4), null);
     clients.get(0).tell(new SendReadRequest(), null);
     clients.get(0).tell(new SendWriteRequest(5), null);
     clients.get(1).tell(new SendWriteRequest(2), null);
-    replicas.get(1).tell(new CrashMsg(CrashStatus.CRASHED), null);
+    replicas.get(6).tell(new CrashMsg(CrashStatus.WRITEOK), null);
     clients.get(1).tell(new SendReadRequest(), null);
     Thread.sleep(1200);
     clients.get(0).tell(new SendWriteRequest(17), null);

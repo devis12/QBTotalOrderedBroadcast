@@ -200,11 +200,11 @@ public class Replica extends AbstractActor {
   public static class SynchronizationMsg extends GenericMessage{
     public final int electionEpoch;
     public final ActorRef newCoordinator;
-    public final Update updToBePerformed;
-    public SynchronizationMsg(int electionEpoch, ActorRef newCoordinator, Update updToBePerformed){
+    public final ArrayDeque<Update> updsToBePerformed;
+    public SynchronizationMsg(int electionEpoch, ActorRef newCoordinator, ArrayDeque<Update> updsToBePerformed){
       this.electionEpoch = electionEpoch;
       this.newCoordinator = newCoordinator;
-      this.updToBePerformed = updToBePerformed;
+      this.updsToBePerformed = updsToBePerformed;
     }
   }
 
@@ -480,17 +480,17 @@ public class Replica extends AbstractActor {
       return;
     synchronization = true;
     System.out.println("[" + getSelf().path().name() + " " + this.clock + "] initiating synchronization to terminate election");
-    Update pendingUpdate = (pendingUpdates.isEmpty())? null : pendingUpdates.getLast();
-    multicastMessageToReplicas(new SynchronizationMsg(this.clock.epoch, getSelf(), pendingUpdate), true);
+    //Update pendingUpdate = (pendingUpdates.isEmpty())? null : pendingUpdates.getLast();
+    multicastMessageToReplicas(new SynchronizationMsg(this.clock.epoch, getSelf(), new ArrayDeque<>(pendingUpdates)), true);
   }
 
   /* delete all pending updates' timers
   */
   private void cancelPendingUpdTimers(){
-    for(Update upd : timersUpdateACK.keySet()) {
+    for(Update upd : timersUpdateACK.keySet())
       timersUpdateACK.get(upd).cancel();
-      timersUpdateACK.remove(upd);
-    }
+    
+    timersUpdateACK.clear();
   }
 
   private void onJoinGroupMsg(JoinGroupMsg msg) {
@@ -836,8 +836,16 @@ public class Replica extends AbstractActor {
     }
 
     //perform last pending update of current epoch, before starting a new one
-    if(msg.updToBePerformed != null) {
-      deliver(msg.updToBePerformed);
+    if(msg.updsToBePerformed != null) {
+      ArrayDeque<Update> msgPendingUpdates = new ArrayDeque<>(msg.updsToBePerformed);
+
+      for(Update upd : pendingUpdates) {//perform all pending updates
+        msgPendingUpdates.remove(upd);
+        deliver(upd);
+      }
+
+      for(Update upd : msgPendingUpdates)//perform all pending updates which the new coordinator has received notification of, while this replica hasn't
+        deliver(upd);
     }
 
     //cleanup pending updates of previous epochs because they're obsolete now
