@@ -13,6 +13,7 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Random;
 import java.util.concurrent.TimeUnit;
@@ -42,15 +43,22 @@ public class Client extends AbstractActor {
     }
   }
 
-  public static class TimeoutReadMsg implements Serializable {}
+  public static class TimeoutReadMsg implements Serializable {
+    private final Integer idRead;
+    public TimeoutReadMsg(Integer idRead){this.idRead = idRead;}
+  }
 
   // replicas that hold value v to be read and/or modified
   private List<ActorRef> replicas;
   // handle timeout for read request
-  private Cancellable timeoutRead;
+  private HashMap<Integer, Cancellable> timeoutRead = new HashMap<>();
+  //read counter
+  private int currentIdRead;
+
 
   public Client(List<ActorRef> replicas) {
     this.replicas = replicas;
+    this.currentIdRead = 0;
   }
 
   static public Props props(List<ActorRef> replicas) {
@@ -113,7 +121,11 @@ public class Client extends AbstractActor {
 
   // Here we define our reaction on the received message from the replica containing the value we're interested
   private void onResponse(Response r) {
-    timeoutRead.cancel();
+    for(int key: timeoutRead.keySet())
+      System.out.println("Client " + getSelf().path().name() + " waiting response for read" + key);
+    System.out.println("Client " + getSelf().path().name() + " received response for read" + r.idRead);
+    timeoutRead.get(r.idRead).cancel();
+    timeoutRead.remove(r.idRead);
     System.out.println("[" +
             getSelf().path().name() +           // the name of the current actor
             "] read done from " +
@@ -127,21 +139,22 @@ public class Client extends AbstractActor {
 
   //Method to trigger externally wrt the client to perform a read
   private void onSendReadRequest(SendReadRequest msg) {
+    currentIdRead++;
     ActorRef replica = selectRandomReplica(); //read from a random replica
-    System.out.println("["+getSelf().path().name()+"] ready to make a read request");
+    System.out.println("["+getSelf().path().name()+"] ready to make a read request (idRead = " + currentIdRead + ")");
     //log  Client <ClientID> read req to <ReplicaID>
     appendLog("Client " + getSelf().path().name() + " read req to " + replica.path().name());
-    replica.tell(new Request(getSelf(), RequestType.READ, null), getSelf());
+    replica.tell(new Request(getSelf(), RequestType.READ, currentIdRead), getSelf());
 
     //timeout for just performed read
-    timeoutRead = getContext().system().scheduler().scheduleWithFixedDelay(
+    timeoutRead.put(currentIdRead, getContext().system().scheduler().scheduleWithFixedDelay(
             Duration.create(TIMEOUT_READ, TimeUnit.MILLISECONDS),               // when to start generating messages
             Duration.create(TIMEOUT_READ, TimeUnit.MILLISECONDS),               // how frequently generate them
             getSelf(),                                              // destination actor reference
-            new TimeoutReadMsg(),                                      // the message to send
+            new TimeoutReadMsg(currentIdRead),                                      // the message to send
             getContext().system().dispatcher(),                     // system dispatcher
             getSelf()                                               // source of the message (myself)
-    );
+    ));
   }
 
   private void onSendWriteRequest(SendWriteRequest msg) {
@@ -151,7 +164,8 @@ public class Client extends AbstractActor {
   }
 
   private void onTimeoutRead(TimeoutReadMsg msg) {
-    timeoutRead.cancel();//timeout has served its purpose
+    timeoutRead.get(msg.idRead).cancel();//timeout has served its purpose
+    timeoutRead.remove(msg.idRead);
     System.out.println("["+getSelf().path().name()+"] read request has FAILED!");
   }
 

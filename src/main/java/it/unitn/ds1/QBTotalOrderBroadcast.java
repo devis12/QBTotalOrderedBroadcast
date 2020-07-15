@@ -62,21 +62,23 @@ public class QBTotalOrderBroadcast {
        #           ACTIONS CONTROL LIST              #
        ###############################################
     */
+    replicas.get(6).tell(new CrashMsg(CrashStatus.AFTER_UPDATE), null);
+    clients.get(0).tell(new SendWriteRequest(8), null);
+    clients.get(1).tell(new SendWriteRequest(4), null);
     clients.get(0).tell(new SendReadRequest(), null);
     clients.get(0).tell(new SendWriteRequest(5), null);
-    replicas.get(1).tell(new CrashMsg(Replica.CrashStatus.BEFORE_REQUEST), null);
     clients.get(1).tell(new SendWriteRequest(2), null);
-    replicas.get(1).tell(new CrashMsg(Replica.CrashStatus.CRASHED), null);
-    Thread.sleep(260);
+    replicas.get(1).tell(new CrashMsg(CrashStatus.CRASHED), null);
     clients.get(1).tell(new SendReadRequest(), null);
     Thread.sleep(1200);
     clients.get(0).tell(new SendWriteRequest(17), null);
-    clients.get(0).tell(new SendWriteRequest(18), null);
-    clients.get(1).tell(new SendWriteRequest(19), null);
-    replicas.get(6).tell(new CrashMsg(Replica.CrashStatus.CRASHED), null);//make the coordinator crash
-    clients.get(0).tell(new SendWriteRequest(20), null);
-    clients.get(1).tell(new SendWriteRequest(22), null);
+    Thread.sleep(5000);
+    clients.get(0).tell(new SendReadRequest(), null);
+    clients.get(0).tell(new SendWriteRequest(5), null);
+    clients.get(1).tell(new SendWriteRequest(2), null);
     clients.get(1).tell(new SendReadRequest(), null);
+    clients.get(0).tell(new SendReadRequest(), null);
+    replicas.get(5).tell(new CrashMsg(CrashStatus.UPDATE), null);
 
     System.out.println(">>> Press ENTER to exit <<<");
     try {
