@@ -173,52 +173,23 @@ public class Replica extends AbstractActor {
 
   // Election message to be sent to next replica up
   public static class ElectionMsg extends GenericMessage{
+    public final int electionMsgID;
     public final int electionEpoch;
     public final Update lastUpdate;
     public final ArrayList<ActorRef> lastUpdateHolders;
-    public ElectionMsg(int electionEpoch, Update lastUpdate, ArrayList<ActorRef> lastUpdateHolders){
+    public ElectionMsg(int electionMsgID, int electionEpoch, Update lastUpdate, ArrayList<ActorRef> lastUpdateHolders){
+      this.electionMsgID = electionMsgID;
       this.electionEpoch = electionEpoch;
       this.lastUpdate = lastUpdate;
       this.lastUpdateHolders = lastUpdateHolders;
     }
-
-    @Override
-    public boolean equals(Object obj) {
-      if (!(obj instanceof ElectionMsg))
-        return false;
-
-      ElectionMsg elMsg2 = (ElectionMsg) obj;
-      if(this.lastUpdateHolders.size() != elMsg2.lastUpdateHolders.size())
-        return false;
-      for(ActorRef r : this.lastUpdateHolders){
-        if(!elMsg2.lastUpdateHolders.contains(r))
-          return false;
-      }
-
-      if(this.lastUpdate == null && elMsg2.lastUpdate == null)
-        return (this.electionEpoch == elMsg2.electionEpoch);
-      else if(this.lastUpdate == null && elMsg2.lastUpdate != null)
-        return false;
-      else
-        return (this.electionEpoch == elMsg2.electionEpoch && this.lastUpdate.equals(elMsg2.lastUpdate));
-    }
-
-    @Override
-    public int hashCode() {
-      int hash = 3;
-      hash = 53 * hash + this.lastUpdateHolders.size();
-      hash = 53 * hash + this.electionEpoch;
-      hash = (this.lastUpdate != null)? 53 * hash + this.lastUpdate.hashCode() : 53 * hash - 1;
-      return hash;
-    }
-
   }
 
   // Election message ack to be sent to next replica up
   public static class ElectionMsgACK extends GenericMessage{
-    public final ElectionMsg electionMsg;
-    public ElectionMsgACK(ElectionMsg electionMsg){
-      this.electionMsg = electionMsg;
+    public final int electionMsgID;
+    public ElectionMsgACK(int electionMsgID){
+      this.electionMsgID = electionMsgID;
     }
   }
 
@@ -255,8 +226,10 @@ public class Replica extends AbstractActor {
   private Cancellable timerHeartBeat;
   // timer for handling coordinator's failure when replica timeouts waiting for the writeOK
   private HashMap<Update, Cancellable> timersUpdateACK = new HashMap<>();
-  // to timeout during election process if not receiving ACK from following replica
-  private HashMap<ElectionMsg, Cancellable> timersElectionMsg = new HashMap<>();
+  // to timeout during election process if not receiving ACK from following replica (id associated to election msgs)
+  private HashMap<Integer, Cancellable> timersElectionMsg = new HashMap<>();
+  // to relate an id to every new election msg within an election epoch
+  private int electionMsgCounter;
   // to timeout during election process if election doesn't come to an end (e.g. caused by crashing of neighbouring nodes)
   private Cancellable timerElectionFailed;
   // is the replica a coordinator
@@ -489,6 +462,8 @@ public class Replica extends AbstractActor {
     if(election)//to avoid to init election, when one is already running
       return;
 
+    electionMsgCounter = 1;
+
     timerHeartBeat.cancel();//coordinator is going to change and timer for heartbeat is going to be reinit when new coordinator is chosen
     //election is supposed to end after a while, otherwise something bad has happened
     timerElectionFailed = initTimeout((TIMEOUT_MSG_UNIT*replicas.size())*replicas.size(),(TIMEOUT_MSG_UNIT*replicas.size())*replicas.size(), new ElectionFailedMsg());
@@ -501,12 +476,12 @@ public class Replica extends AbstractActor {
     lastUpdateHolders.add(getSelf());
     ElectionMsg newElectionMsg = null;
     if(pendingUpdates.size() > 0)//pick your last update to forward on if there is any
-      newElectionMsg = new ElectionMsg(clock.epoch, pendingUpdates.getLast(), lastUpdateHolders);
+      newElectionMsg = new ElectionMsg(electionMsgCounter, clock.epoch, pendingUpdates.getLast(), lastUpdateHolders);
     else
-      newElectionMsg = new ElectionMsg(clock.epoch,null, lastUpdateHolders);
+      newElectionMsg = new ElectionMsg(electionMsgCounter, clock.epoch,null, lastUpdateHolders);
     sendMessage(receivingReplica, newElectionMsg);
 
-    timersElectionMsg.put(newElectionMsg, initTimeout(TIMEOUT_MSG_UNIT * replicas.size(), TIMEOUT_MSG_UNIT * replicas.size(),new ElectionMsgACKTimeout(receivingReplica, newElectionMsg)));
+    timersElectionMsg.put(electionMsgCounter, initTimeout(TIMEOUT_MSG_UNIT * replicas.size(), TIMEOUT_MSG_UNIT * replicas.size(),new ElectionMsgACKTimeout(receivingReplica, newElectionMsg)));
   }
 
   /*  Terminate election process by broadcasting to all, that youp're the new coordinator
@@ -532,8 +507,8 @@ public class Replica extends AbstractActor {
   /* delete all election msg ack timers
    */
   private void cancelElectionMsgACKTimers(){
-    for(ElectionMsg elMsg : timersElectionMsg.keySet())
-      timersElectionMsg.get(elMsg).cancel();
+    for(Integer elMsgID : timersElectionMsg.keySet())
+      timersElectionMsg.get(elMsgID).cancel();
 
     timersElectionMsg.clear();
   }
@@ -760,12 +735,14 @@ public class Replica extends AbstractActor {
       timerHeartBeat.cancel();//coordinator is going to change and timer for heartbeat is going to be reinit when new coordinator is chosen
       cancelPendingUpdTimers();//cancel pending upd timers
       timerElectionFailed = initTimeout((TIMEOUT_MSG_UNIT * replicas.size()) * replicas.size(), (TIMEOUT_MSG_UNIT * replicas.size()) * replicas.size(), new ElectionFailedMsg());
+      electionMsgCounter = 0;
     }
 
     System.out.println("[" + getSelf().path().name() + " " + this.clock + "] received election msg from " + getSender().path().name() + "(electionEpoch:"+msg.electionEpoch+")");
     election = true;// in case this replica is not already in election mode (e.g. coordinator's timeout detected by someone else)
+    electionMsgCounter++;
 
-    sendMessage(getSender(), new ElectionMsgACK(msg));//ack of election msg
+    sendMessage(getSender(), new ElectionMsgACK(msg.electionMsgID));//ack of election msg
 
     ActorRef receivingReplica = selectNextReplica(getSelf(), true);
     ElectionMsg newElectionmsg;
@@ -776,10 +753,10 @@ public class Replica extends AbstractActor {
           synchronization();//broadcast to everyone you're the new coordinator
         
       }else{//just pass along msg, election has converged, but you're not the best candidate
-        newElectionmsg = msg;
+        newElectionmsg = new ElectionMsg(electionMsgCounter, msg.electionEpoch, msg.lastUpdate, msg.lastUpdateHolders);
         sendMessage(receivingReplica, newElectionmsg);
 
-        timersElectionMsg.put(newElectionmsg, initTimeout(TIMEOUT_MSG_UNIT * replicas.size(), TIMEOUT_MSG_UNIT * replicas.size(),new ElectionMsgACKTimeout(receivingReplica, newElectionmsg)));
+        timersElectionMsg.put(electionMsgCounter, initTimeout(TIMEOUT_MSG_UNIT * replicas.size(), TIMEOUT_MSG_UNIT * replicas.size(),new ElectionMsgACKTimeout(receivingReplica, newElectionmsg)));
       }
 
     }else{
@@ -787,32 +764,32 @@ public class Replica extends AbstractActor {
       if(pendingUpdates.isEmpty() && msg.lastUpdate == null) {//no pending update is circulating until now and this replica hasn't any
         ArrayList<ActorRef> lastUpdateHolders = msg.lastUpdateHolders;
         lastUpdateHolders.add(getSelf());
-        newElectionmsg = new ElectionMsg(clock.epoch, null, lastUpdateHolders);
+        newElectionmsg = new ElectionMsg(electionMsgCounter, clock.epoch, null, lastUpdateHolders);
 
       }else if(pendingUpdates.size() > 0 && msg.lastUpdate == null) {//mine considered to be the more recent update, since there is none in the election msg
         //NOTE considered this also as the case in which the WRITEOK has just reached some replicas and not all, thus this can be considered as an old update by other replicas
         //TODO handle unfinished update, i.e. case in which WRITEOK has not reached everyone... this can be also considered as a last update to repeat to everyone and things would still be okay (I think...)
         ArrayList<ActorRef> lastUpdateHolders = new ArrayList<>();
         lastUpdateHolders.add(getSelf());
-        newElectionmsg = new ElectionMsg(clock.epoch, pendingUpdates.getLast(), lastUpdateHolders);
+        newElectionmsg = new ElectionMsg(electionMsgCounter, clock.epoch, pendingUpdates.getLast(), lastUpdateHolders);
 
       }else if(pendingUpdates.isEmpty() || (msg.lastUpdate.moreRecent(pendingUpdates.getLast()))) {//this replica has pending updates (or not) and its last pending upd is not more recent than the one inside the election msg
-        newElectionmsg = msg;//just forward election msg
+        newElectionmsg = new ElectionMsg(electionMsgCounter, msg.electionEpoch, msg.lastUpdate, msg.lastUpdateHolders);//just forward election msg
 
       }else if(msg.lastUpdate.equals(pendingUpdates.getLast())) {//last pending update equals to the one in this replica,add itself between best candidates
         ArrayList<ActorRef> lastUpdateHolders = msg.lastUpdateHolders;
         lastUpdateHolders.add(getSelf());
-        newElectionmsg = new ElectionMsg(clock.epoch, pendingUpdates.getLast(), lastUpdateHolders);
+        newElectionmsg = new ElectionMsg(electionMsgCounter, clock.epoch, pendingUpdates.getLast(), lastUpdateHolders);
 
       }else { //my update is more recent one, update election msg before forwarding
         ArrayList<ActorRef> lastUpdateHolders = new ArrayList<>();
         lastUpdateHolders.add(getSelf());
-        newElectionmsg = new ElectionMsg(clock.epoch, pendingUpdates.getLast(), lastUpdateHolders);
+        newElectionmsg = new ElectionMsg(electionMsgCounter, clock.epoch, pendingUpdates.getLast(), lastUpdateHolders);
       }
 
       sendMessage(receivingReplica, newElectionmsg);
 
-      timersElectionMsg.put(newElectionmsg, initTimeout(TIMEOUT_MSG_UNIT * replicas.size(), TIMEOUT_MSG_UNIT * replicas.size(),new ElectionMsgACKTimeout(receivingReplica, newElectionmsg)));
+      timersElectionMsg.put(electionMsgCounter, initTimeout(TIMEOUT_MSG_UNIT * replicas.size(), TIMEOUT_MSG_UNIT * replicas.size(),new ElectionMsgACKTimeout(receivingReplica, newElectionmsg)));
 
     }
   }
@@ -827,22 +804,14 @@ public class Replica extends AbstractActor {
 
     //cancel timeout for election msg ack
     try{
-      timersElectionMsg.get(msg.electionMsg).cancel();
-      timersElectionMsg.remove(msg.electionMsg);
+      timersElectionMsg.get(msg.electionMsgID).cancel();
+      timersElectionMsg.remove(msg.electionMsgID);
     }catch(NullPointerException nex){
-      System.err.println("[" + getSelf().path().name() + " " + this.clock + "] NULL POINTER ON elMsg:" );
-      if(msg.electionMsg.lastUpdate != null)
-        System.err.println("[" + getSelf().path().name() + " " + this.clock + "] elMsg epoch " + msg.electionMsg.electionEpoch + ", updHolders: " + msg.electionMsg.lastUpdateHolders.size() + ", last upd " + msg.electionMsg.lastUpdate.v + " - " + msg.electionMsg.lastUpdate.clock);
-      else
-        System.err.println("[" + getSelf().path().name() + " " + this.clock + "] elMsg epoch " + msg.electionMsg.electionEpoch + ", updHolders: " + msg.electionMsg.lastUpdateHolders.size() + ", last upd null");
+      System.err.println("[" + getSelf().path().name() + " " + this.clock + "] NULL POINTER ON elMsgACK received for elMsg with ID " + msg.electionMsgID);
       System.err.println("[" + getSelf().path().name() + " " + this.clock + "] BEFORE FOR ");
-      for(ElectionMsg elMsg : timersElectionMsg.keySet()) {
-        if(elMsg.lastUpdate != null)
-          System.err.println("[" + getSelf().path().name() + " " + this.clock + "] elMsg epoch " + elMsg.electionEpoch + ", updHolders: " + elMsg.lastUpdateHolders.size() + ", last upd " + elMsg.lastUpdate.v + " - " + elMsg.lastUpdate.clock);
-        else
-          System.err.println("[" + getSelf().path().name() + " " + this.clock + "] elMsg epoch " + elMsg.electionEpoch + ", updHolders: " + elMsg.lastUpdateHolders.size() + ", last upd null");
-        System.err.println("[" + getSelf().path().name() + " " + this.clock + "] EQUALS: " + elMsg.equals(msg.electionMsg));
-      }
+      for(Integer id : timersElectionMsg.keySet())
+        System.err.println("\t[" + getSelf().path().name() + " " + this.clock + "] el msg in timerElMsgACK hashmap with ID " + id);
+
       System.err.println("[" + getSelf().path().name() + " " + this.clock + "] AFTER FOR ");
     }
   }
@@ -863,27 +832,20 @@ public class Replica extends AbstractActor {
     System.out.println("[" + getSelf().path().name() + " " + this.clock + "] not received ACK from " + msg.receivingReplica.path().name() + " during election");
     //send election message to next replica wrt the one that didn't answer causing this timeout
     ActorRef receivingReplica = selectNextReplica(msg.receivingReplica, true);
-    sendMessage(receivingReplica, msg.electionMsg);
+    electionMsgCounter++;
+    sendMessage(receivingReplica, new ElectionMsg(electionMsgCounter, msg.electionMsg.electionEpoch, msg.electionMsg.lastUpdate, msg.electionMsg.lastUpdateHolders));
 
     try{
-      timersElectionMsg.get(msg.electionMsg).cancel();
-      timersElectionMsg.remove(msg.electionMsg);
-      timersElectionMsg.put(msg.electionMsg, initTimeout(TIMEOUT_MSG_UNIT * replicas.size(), TIMEOUT_MSG_UNIT * replicas.size(),new ElectionMsgACKTimeout(receivingReplica, msg.electionMsg)));
+      timersElectionMsg.get(msg.electionMsg.electionMsgID).cancel();
+      timersElectionMsg.remove(msg.electionMsg.electionMsgID);
+      timersElectionMsg.put(electionMsgCounter, initTimeout(TIMEOUT_MSG_UNIT * replicas.size(), TIMEOUT_MSG_UNIT * replicas.size(),new ElectionMsgACKTimeout(receivingReplica, msg.electionMsg)));
     }catch(NullPointerException nex){
       nex.printStackTrace();
-      System.err.println("[" + getSelf().path().name() + " " + this.clock + "] NULL POINTER ON elMsg:" );
-      if(msg.electionMsg.lastUpdate != null)
-        System.err.println("[" + getSelf().path().name() + " " + this.clock + "] elMsg epoch " + msg.electionMsg.electionEpoch + ", updHolders: " + msg.electionMsg.lastUpdateHolders.size() + ", last upd " + msg.electionMsg.lastUpdate.v + " - " + msg.electionMsg.lastUpdate.clock);
-      else
-        System.err.println("[" + getSelf().path().name() + " " + this.clock + "] elMsg epoch " + msg.electionMsg.electionEpoch + ", updHolders: " + msg.electionMsg.lastUpdateHolders.size() + ", last upd null");
+      System.err.println("[" + getSelf().path().name() + " " + this.clock + "] NULL POINTER ON elMsgACK NOT received for elMsg with ID " + msg.electionMsg.electionMsgID);
       System.err.println("[" + getSelf().path().name() + " " + this.clock + "] BEFORE FOR ");
-      for(ElectionMsg elMsg : timersElectionMsg.keySet()) {
-        if(elMsg.lastUpdate != null)
-          System.err.println("[" + getSelf().path().name() + " " + this.clock + "] elMsg epoch " + elMsg.electionEpoch + ", updHolders: " + elMsg.lastUpdateHolders.size() + ", last upd " + elMsg.lastUpdate.v + " - " + elMsg.lastUpdate.clock);
-        else
-          System.err.println("[" + getSelf().path().name() + " " + this.clock + "] elMsg epoch " + elMsg.electionEpoch + ", updHolders: " + elMsg.lastUpdateHolders.size() + ", last upd null");
-        System.err.println("[" + getSelf().path().name() + " " + this.clock + "] EQUALS: " + elMsg.equals(msg.electionMsg));
-      }
+      for(Integer id : timersElectionMsg.keySet())
+        System.err.println("\t[" + getSelf().path().name() + " " + this.clock + "] el msg in timerElMsgACK hashmap with ID " + id);
+
       System.err.println("[" + getSelf().path().name() + " " + this.clock + "] AFTER FOR ");
     }
 
