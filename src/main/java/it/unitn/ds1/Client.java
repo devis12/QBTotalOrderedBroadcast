@@ -141,7 +141,7 @@ public class Client extends AbstractActor {
   private void onSendReadRequest(SendReadRequest msg) {
     currentIdRead++;
     ActorRef replica = selectRandomReplica(); //read from a random replica
-    System.out.println("["+getSelf().path().name()+"] ready to make a read request (idRead = " + currentIdRead + ")");
+    System.out.println("["+getSelf().path().name()+"] ready to make a read request (idRead = " + currentIdRead + ") to " + replica.path().name());
     //log  Client <ClientID> read req to <ReplicaID>
     appendLog("Client " + getSelf().path().name() + " read req to " + replica.path().name());
     replica.tell(new Request(getSelf(), RequestType.READ, currentIdRead), getSelf());
@@ -159,7 +159,7 @@ public class Client extends AbstractActor {
 
   private void onSendWriteRequest(SendWriteRequest msg) {
     ActorRef replica = selectRandomReplica();
-    System.out.println(""+getSelf().path().name()+" ready to make a write request");
+    System.out.println(""+getSelf().path().name()+" ready to make a write request to " + replica.path().name() + " proposing value " + msg.v);
     replica.tell(new Request(getSelf(), RequestType.WRITE, msg.v), getSelf());
   }
 

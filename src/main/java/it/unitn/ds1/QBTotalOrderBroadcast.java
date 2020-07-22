@@ -65,20 +65,29 @@ public class QBTotalOrderBroadcast {
     
     clients.get(0).tell(new SendWriteRequest(8), null);
     clients.get(1).tell(new SendWriteRequest(4), null);
+    Thread.sleep(2000);
     clients.get(0).tell(new SendReadRequest(), null);
-    clients.get(0).tell(new SendWriteRequest(5), null);
-    clients.get(1).tell(new SendWriteRequest(2), null);
-    replicas.get(6).tell(new CrashMsg(CrashStatus.WRITEOK), null);
+    replicas.get(2).tell(new CrashMsg(CrashStatus.CRASHED), null);
+    //replicas.get(6).tell(new CrashMsg(CrashStatus.WRITEOK), null);
     clients.get(1).tell(new SendReadRequest(), null);
-    Thread.sleep(1200);
     clients.get(0).tell(new SendWriteRequest(17), null);
-    Thread.sleep(5000);
     clients.get(0).tell(new SendReadRequest(), null);
     clients.get(0).tell(new SendWriteRequest(5), null);
     clients.get(1).tell(new SendWriteRequest(2), null);
+    Thread.sleep(200);
+    replicas.get(6).tell(new CrashMsg(CrashStatus.CRASHED), null);
     clients.get(1).tell(new SendReadRequest(), null);
     clients.get(0).tell(new SendReadRequest(), null);
-    replicas.get(5).tell(new CrashMsg(CrashStatus.UPDATE), null);
+    replicas.get(4).tell(new CrashMsg(CrashStatus.CRASHED), null);
+    Thread.sleep(800);
+    clients.get(1).tell(new SendReadRequest(), null);
+    Thread.sleep(7000);
+    clients.get(0).tell(new SendWriteRequest(555), null);
+    Thread.sleep(1200);
+    clients.get(1).tell(new SendReadRequest(), null);
+    clients.get(0).tell(new SendReadRequest(), null);
+    clients.get(0).tell(new SendWriteRequest(712), null);
+    //replicas.get(5).tell(new CrashMsg(CrashStatus.UPDATE), null);
 
     System.out.println(">>> Press ENTER to exit <<<");
     try {

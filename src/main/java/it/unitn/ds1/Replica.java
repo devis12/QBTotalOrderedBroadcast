@@ -21,14 +21,14 @@ public class Replica extends AbstractActor {
   private static final String logFolderPath = "logs";
 
   //interval to generate heartbeat (coordinator) (increase it proportional to num of tot replicas)
-  private static int INTERVAL_HEARTBEAT_UNIT = 500;
+  private static int INTERVAL_HEARTBEAT_UNIT = 512;
   //interval at which replica expects heartbeat (increase it proportional to num of tot replicas)
-  private static int TIMEOUT_HEARTBEAT_UNIT = 1100;
+  private static int TIMEOUT_HEARTBEAT_UNIT = 1024;
 
   //Timeout when expepecting messages in response from coordinator (increase it proportional to num of tot replicas)
-  private static int TIMEOUT_MSG_UNIT = 250;
+  private static int TIMEOUT_MSG_UNIT = 256;
   //Max time allowed for link communication delays
-  private static int MAX_NETWORK_DELAY = 50;
+  private static int MAX_NETWORK_DELAY = 64;
 
   public static class GenericMessage implements Serializable{}
 
@@ -181,10 +181,46 @@ public class Replica extends AbstractActor {
       this.lastUpdate = lastUpdate;
       this.lastUpdateHolders = lastUpdateHolders;
     }
+
+    @Override
+    public boolean equals(Object obj) {
+      if (!(obj instanceof ElectionMsg))
+        return false;
+
+      ElectionMsg elMsg2 = (ElectionMsg) obj;
+      if(this.lastUpdateHolders.size() != elMsg2.lastUpdateHolders.size())
+        return false;
+      for(ActorRef r : this.lastUpdateHolders){
+        if(!elMsg2.lastUpdateHolders.contains(r))
+          return false;
+      }
+
+      if(this.lastUpdate == null && elMsg2.lastUpdate == null)
+        return (this.electionEpoch == elMsg2.electionEpoch);
+      else if(this.lastUpdate == null && elMsg2.lastUpdate != null)
+        return false;
+      else
+        return (this.electionEpoch == elMsg2.electionEpoch && this.lastUpdate.equals(elMsg2.lastUpdate));
+    }
+
+    @Override
+    public int hashCode() {
+      int hash = 3;
+      hash = 53 * hash + this.lastUpdateHolders.size();
+      hash = 53 * hash + this.electionEpoch;
+      hash = (this.lastUpdate != null)? 53 * hash + this.lastUpdate.hashCode() : 53 * hash - 1;
+      return hash;
+    }
+
   }
 
   // Election message ack to be sent to next replica up
-  public static class ElectionMsgACK extends GenericMessage{}
+  public static class ElectionMsgACK extends GenericMessage{
+    public final ElectionMsg electionMsg;
+    public ElectionMsgACK(ElectionMsg electionMsg){
+      this.electionMsg = electionMsg;
+    }
+  }
 
   // Election message to be sent to next replica up
   public static class ElectionMsgACKTimeout extends GenericMessage{
@@ -220,7 +256,7 @@ public class Replica extends AbstractActor {
   // timer for handling coordinator's failure when replica timeouts waiting for the writeOK
   private HashMap<Update, Cancellable> timersUpdateACK = new HashMap<>();
   // to timeout during election process if not receiving ACK from following replica
-  private Cancellable timerElectionMsg;
+  private HashMap<ElectionMsg, Cancellable> timersElectionMsg = new HashMap<>();
   // to timeout during election process if election doesn't come to an end (e.g. caused by crashing of neighbouring nodes)
   private Cancellable timerElectionFailed;
   // is the replica a coordinator
@@ -277,17 +313,17 @@ public class Replica extends AbstractActor {
     if(msg.getClass() ==  Update.class){
 
       System.out.println("[" + getSelf().path().name() + " " + this.clock + "] sending UPDATE msg " + ((Update)msg).v + " " +
-              ((Update)msg).clock.epoch + "-" + ((Update)msg).clock.sn + " to " + receiver.path().name());
+              ((Update)msg).clock + " to " + receiver.path().name());
     }
     if(msg.getClass() ==  UpdateACK.class){
 
       System.out.println("[" + getSelf().path().name() + " " + this.clock + "] sending UPDATEACK msg " + ((UpdateACK)msg).v + " " +
-              ((UpdateACK)msg).clock.epoch + "-" + ((UpdateACK)msg).clock.sn + " to " + receiver.path().name());
+              ((UpdateACK)msg).clock + " to " + receiver.path().name());
     }
     if(msg.getClass() == WriteOK.class){
 
       System.out.println("[" + getSelf().path().name() + " " + this.clock + "] sending WRITEOK msg " + ((WriteOK)msg).v + " " +
-              ((WriteOK)msg).clock.epoch + "-" + ((WriteOK)msg).clock.sn + " to " + receiver.path().name());
+              ((WriteOK)msg).clock + " to " + receiver.path().name());
     }
     //try{Thread.sleep(2000);}catch(Exception e){}
 
@@ -313,7 +349,7 @@ public class Replica extends AbstractActor {
       }
 
       System.out.println("[" + getSelf().path().name() + " " + this.clock + "] multicasting UPDATE msg " + ((Update)msg).v + " " +
-              ((Update)msg).clock.epoch + "-" + ((Update)msg).clock.sn);
+              ((Update)msg).clock);
     }
     if(msg.getClass() == WriteOK.class){
       if(crashed == CrashStatus.BEFORE_WRITEOK){//coordinator is asked to crash before writeOK
@@ -322,7 +358,7 @@ public class Replica extends AbstractActor {
         return;
       }
       System.out.println("[" + getSelf().path().name() + " " + this.clock + "] multicasting WRITEOK msg " + ((WriteOK)msg).v + " " +
-              ((WriteOK)msg).clock.epoch + "-" + ((WriteOK)msg).clock.sn);
+              ((WriteOK)msg).clock);
     }
     
     // randomly arrange replicas
@@ -392,7 +428,7 @@ public class Replica extends AbstractActor {
     //perforn update
     this.v = upd.v;
     System.out.println("[" + getSelf().path().name() + " " + this.clock + "]" +
-            " update " + upd.clock.epoch + ":" + upd.clock.sn + " " + upd.v);
+            " update " + upd.clock + " " + upd.v);
 
     //write also in log file //Replica <ReplicaID> update <e>:<i> <value>
     appendLog("Replica " + getSelf().path().name() + " update " + upd.clock + " " + upd.v);
@@ -470,7 +506,7 @@ public class Replica extends AbstractActor {
       newElectionMsg = new ElectionMsg(clock.epoch,null, lastUpdateHolders);
     sendMessage(receivingReplica, newElectionMsg);
 
-    timerElectionMsg = initTimeout(TIMEOUT_MSG_UNIT * replicas.size(), TIMEOUT_MSG_UNIT * replicas.size(),new ElectionMsgACKTimeout(receivingReplica, newElectionMsg));
+    timersElectionMsg.put(newElectionMsg, initTimeout(TIMEOUT_MSG_UNIT * replicas.size(), TIMEOUT_MSG_UNIT * replicas.size(),new ElectionMsgACKTimeout(receivingReplica, newElectionMsg)));
   }
 
   /*  Terminate election process by broadcasting to all, that youp're the new coordinator
@@ -491,6 +527,15 @@ public class Replica extends AbstractActor {
       timersUpdateACK.get(upd).cancel();
     
     timersUpdateACK.clear();
+  }
+
+  /* delete all election msg ack timers
+   */
+  private void cancelElectionMsgACKTimers(){
+    for(ElectionMsg elMsg : timersElectionMsg.keySet())
+      timersElectionMsg.get(elMsg).cancel();
+
+    timersElectionMsg.clear();
   }
 
   private void onJoinGroupMsg(JoinGroupMsg msg) {
@@ -597,7 +642,7 @@ public class Replica extends AbstractActor {
 
     int quorum = (((int) replicas.size())/2) + 1;
     Update updToConfirm = Update.toUpdate(upd);
-    if(acksReceived > quorum && timersUpdateACK.get(updToConfirm) != null){//WRITEOK
+    if(acksReceived >= quorum && timersUpdateACK.get(updToConfirm) != null){//WRITEOK
       timersUpdateACK.get(updToConfirm).cancel();
       timersUpdateACK.remove(updToConfirm);
       multicastMessageToReplicas(new WriteOK(upd.clock, upd.v), true);
@@ -638,12 +683,9 @@ public class Replica extends AbstractActor {
 
       if(updDel != null){
         deliver(updDel);
-        //check if other pending updates can be delivered
-        for(Update upd : pendingUpdates){
-          if(canDeliver(upd))
-            deliver(upd);
-        }
+        //check if other pending updates can be delivered? no need assuming fifo and reliable links, writeOK will arrive in the right order
       }
+
     }
 
     if(crashed == CrashStatus.AFTER_WRITEOK) {//state has to be crashed NOW
@@ -684,10 +726,14 @@ public class Replica extends AbstractActor {
   /*  replicas notify themselves about the coordinator not replying when it is supposed to (i.e. it's crashed)
    * */
   private void onCoordinatorTimeout(CoordinatorTimeout msg) {
-    cancelPendingUpdTimers();
+    if(crashed == CrashStatus.CRASHED)//don't answer to msg if state is crashed
+      return;
 
-    System.err.println("[" + getSelf().path().name() + " " + this.clock + "] FAILURE OF THE COORDINATOR: reply not arrived after sending updateACK for " + msg.update.v + " - " + msg.update.clock);
-    initiateElection();//start election process
+    cancelPendingUpdTimers();
+    if(!election) {
+      System.err.println("[" + getSelf().path().name() + " " + this.clock + "] FAILURE OF THE COORDINATOR: reply not arrived after sending updateACK for " + msg.update.v + " - " + msg.update.clock);
+      initiateElection();//start election process
+    }
   }
 
   /*  Coordinator heartbeat to signal the fact that it is still up
@@ -712,13 +758,14 @@ public class Replica extends AbstractActor {
 
     if(!election) {//this msg has been stating the start of the election, which is supposed to end after a while, otherwise something bad has happened
       timerHeartBeat.cancel();//coordinator is going to change and timer for heartbeat is going to be reinit when new coordinator is chosen
+      cancelPendingUpdTimers();//cancel pending upd timers
       timerElectionFailed = initTimeout((TIMEOUT_MSG_UNIT * replicas.size()) * replicas.size(), (TIMEOUT_MSG_UNIT * replicas.size()) * replicas.size(), new ElectionFailedMsg());
     }
 
     System.out.println("[" + getSelf().path().name() + " " + this.clock + "] received election msg from " + getSender().path().name() + "(electionEpoch:"+msg.electionEpoch+")");
     election = true;// in case this replica is not already in election mode (e.g. coordinator's timeout detected by someone else)
 
-    sendMessage(getSender(), new ElectionMsgACK());//ack of election msg
+    sendMessage(getSender(), new ElectionMsgACK(msg));//ack of election msg
 
     ActorRef receivingReplica = selectNextReplica(getSelf(), true);
     ElectionMsg newElectionmsg;
@@ -732,7 +779,7 @@ public class Replica extends AbstractActor {
         newElectionmsg = msg;
         sendMessage(receivingReplica, newElectionmsg);
 
-        timerElectionMsg = initTimeout(TIMEOUT_MSG_UNIT * replicas.size(), TIMEOUT_MSG_UNIT * replicas.size(),new ElectionMsgACKTimeout(receivingReplica, newElectionmsg));
+        timersElectionMsg.put(newElectionmsg, initTimeout(TIMEOUT_MSG_UNIT * replicas.size(), TIMEOUT_MSG_UNIT * replicas.size(),new ElectionMsgACKTimeout(receivingReplica, newElectionmsg)));
       }
 
     }else{
@@ -765,7 +812,7 @@ public class Replica extends AbstractActor {
 
       sendMessage(receivingReplica, newElectionmsg);
 
-      timerElectionMsg = initTimeout(TIMEOUT_MSG_UNIT * replicas.size(), TIMEOUT_MSG_UNIT * replicas.size(),new ElectionMsgACKTimeout(receivingReplica, newElectionmsg));
+      timersElectionMsg.put(newElectionmsg, initTimeout(TIMEOUT_MSG_UNIT * replicas.size(), TIMEOUT_MSG_UNIT * replicas.size(),new ElectionMsgACKTimeout(receivingReplica, newElectionmsg)));
 
     }
   }
@@ -777,8 +824,27 @@ public class Replica extends AbstractActor {
       return;
 
     System.out.println("[" + getSelf().path().name() + " " + this.clock + "] received ACK from " + getSender().path().name() + " during election");
+
     //cancel timeout for election msg ack
-    timerElectionMsg.cancel();
+    try{
+      timersElectionMsg.get(msg.electionMsg).cancel();
+      timersElectionMsg.remove(msg.electionMsg);
+    }catch(NullPointerException nex){
+      System.err.println("[" + getSelf().path().name() + " " + this.clock + "] NULL POINTER ON elMsg:" );
+      if(msg.electionMsg.lastUpdate != null)
+        System.err.println("[" + getSelf().path().name() + " " + this.clock + "] elMsg epoch " + msg.electionMsg.electionEpoch + ", updHolders: " + msg.electionMsg.lastUpdateHolders.size() + ", last upd " + msg.electionMsg.lastUpdate.v + " - " + msg.electionMsg.lastUpdate.clock);
+      else
+        System.err.println("[" + getSelf().path().name() + " " + this.clock + "] elMsg epoch " + msg.electionMsg.electionEpoch + ", updHolders: " + msg.electionMsg.lastUpdateHolders.size() + ", last upd null");
+      System.err.println("[" + getSelf().path().name() + " " + this.clock + "] BEFORE FOR ");
+      for(ElectionMsg elMsg : timersElectionMsg.keySet()) {
+        if(elMsg.lastUpdate != null)
+          System.err.println("[" + getSelf().path().name() + " " + this.clock + "] elMsg epoch " + elMsg.electionEpoch + ", updHolders: " + elMsg.lastUpdateHolders.size() + ", last upd " + elMsg.lastUpdate.v + " - " + elMsg.lastUpdate.clock);
+        else
+          System.err.println("[" + getSelf().path().name() + " " + this.clock + "] elMsg epoch " + elMsg.electionEpoch + ", updHolders: " + elMsg.lastUpdateHolders.size() + ", last upd null");
+        System.err.println("[" + getSelf().path().name() + " " + this.clock + "] EQUALS: " + elMsg.equals(msg.electionMsg));
+      }
+      System.err.println("[" + getSelf().path().name() + " " + this.clock + "] AFTER FOR ");
+    }
   }
 
   /*  Following replica seems to have failed as well, forward to next one
@@ -799,8 +865,28 @@ public class Replica extends AbstractActor {
     ActorRef receivingReplica = selectNextReplica(msg.receivingReplica, true);
     sendMessage(receivingReplica, msg.electionMsg);
 
-    timerElectionMsg.cancel();
-    timerElectionMsg = initTimeout(TIMEOUT_MSG_UNIT * replicas.size(), TIMEOUT_MSG_UNIT * replicas.size(),new ElectionMsgACKTimeout(receivingReplica, msg.electionMsg));
+    try{
+      timersElectionMsg.get(msg.electionMsg).cancel();
+      timersElectionMsg.remove(msg.electionMsg);
+      timersElectionMsg.put(msg.electionMsg, initTimeout(TIMEOUT_MSG_UNIT * replicas.size(), TIMEOUT_MSG_UNIT * replicas.size(),new ElectionMsgACKTimeout(receivingReplica, msg.electionMsg)));
+    }catch(NullPointerException nex){
+      nex.printStackTrace();
+      System.err.println("[" + getSelf().path().name() + " " + this.clock + "] NULL POINTER ON elMsg:" );
+      if(msg.electionMsg.lastUpdate != null)
+        System.err.println("[" + getSelf().path().name() + " " + this.clock + "] elMsg epoch " + msg.electionMsg.electionEpoch + ", updHolders: " + msg.electionMsg.lastUpdateHolders.size() + ", last upd " + msg.electionMsg.lastUpdate.v + " - " + msg.electionMsg.lastUpdate.clock);
+      else
+        System.err.println("[" + getSelf().path().name() + " " + this.clock + "] elMsg epoch " + msg.electionMsg.electionEpoch + ", updHolders: " + msg.electionMsg.lastUpdateHolders.size() + ", last upd null");
+      System.err.println("[" + getSelf().path().name() + " " + this.clock + "] BEFORE FOR ");
+      for(ElectionMsg elMsg : timersElectionMsg.keySet()) {
+        if(elMsg.lastUpdate != null)
+          System.err.println("[" + getSelf().path().name() + " " + this.clock + "] elMsg epoch " + elMsg.electionEpoch + ", updHolders: " + elMsg.lastUpdateHolders.size() + ", last upd " + elMsg.lastUpdate.v + " - " + elMsg.lastUpdate.clock);
+        else
+          System.err.println("[" + getSelf().path().name() + " " + this.clock + "] elMsg epoch " + elMsg.electionEpoch + ", updHolders: " + elMsg.lastUpdateHolders.size() + ", last upd null");
+        System.err.println("[" + getSelf().path().name() + " " + this.clock + "] EQUALS: " + elMsg.equals(msg.electionMsg));
+      }
+      System.err.println("[" + getSelf().path().name() + " " + this.clock + "] AFTER FOR ");
+    }
+
   }
 
   /*  Received synchronization msg as result of convergence in election protocol
@@ -817,6 +903,7 @@ public class Replica extends AbstractActor {
       return;
 
     timerElectionFailed.cancel();//election has not failed
+    cancelElectionMsgACKTimers();//you're not waiting for any election msg anymore
     election = false;//election mode terminated
 
     System.out.println("[" + getSelf().path().name() + " " + this.clock + "] received synchronization msg from " + getSender().path().name());
