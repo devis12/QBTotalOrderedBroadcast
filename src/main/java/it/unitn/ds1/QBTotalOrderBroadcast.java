@@ -78,7 +78,7 @@ public class QBTotalOrderBroadcast {
     replicas.get(6).tell(new CrashMsg(CrashStatus.CRASHED), null);
     clients.get(1).tell(new SendReadRequest(), null);
     clients.get(0).tell(new SendReadRequest(), null);
-    replicas.get(4).tell(new CrashMsg(CrashStatus.CRASHED), null);
+    replicas.get(4).tell(new CrashMsg(CrashStatus.BEFORE_ELECTION), null);
     Thread.sleep(800);
     clients.get(1).tell(new SendReadRequest(), null);
     Thread.sleep(7000);

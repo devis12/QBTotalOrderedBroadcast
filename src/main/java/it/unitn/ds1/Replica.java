@@ -60,7 +60,9 @@ public class Replica extends AbstractActor {
     BEFORE_REQUEST, //crashed just before processing request (for common replica)
     AFTER_REQUEST, //crashed just after processing request (for common replica)
     BEFORE_UPDATEACK,//crashed just before processing updateack (for coordinator)
-    AFTER_UPDATEACK //crashed just after processing updateack (for coordinator)
+    AFTER_UPDATEACK, //crashed just after processing updateack (for coordinator)
+    BEFORE_ELECTION, //crashed just after processing election msg (for replica)
+    AFTER_ELECTION //crashed just after processing election msg (for replica)
   };
   /*tells a replica (or the coordinator) to enter crash mode before doing a specific action (if specified)
   FALSE: the replica is still active | GENERAL: crash immediately | UDPDATE: crash the next time you have to forward an UPDATE msg 
@@ -464,6 +466,7 @@ public class Replica extends AbstractActor {
 
     electionMsgCounter = 1;
 
+    cancelPendingUpdTimers();
     timerHeartBeat.cancel();//coordinator is going to change and timer for heartbeat is going to be reinit when new coordinator is chosen
     //election is supposed to end after a while, otherwise something bad has happened
     timerElectionFailed = initTimeout((TIMEOUT_MSG_UNIT*replicas.size())*replicas.size(),(TIMEOUT_MSG_UNIT*replicas.size())*replicas.size(), new ElectionFailedMsg());
@@ -618,7 +621,7 @@ public class Replica extends AbstractActor {
     int quorum = (((int) replicas.size())/2) + 1;
     Update updToConfirm = Update.toUpdate(upd);
     if(acksReceived >= quorum && timersUpdateACK.get(updToConfirm) != null){//WRITEOK
-      timersUpdateACK.get(updToConfirm).cancel();
+      timersUpdateACK.get(updToConfirm).cancel();//coordinator deleting its timer for this update
       timersUpdateACK.remove(updToConfirm);
       multicastMessageToReplicas(new WriteOK(upd.clock, upd.v), true);
     }
@@ -727,6 +730,12 @@ public class Replica extends AbstractActor {
     if(crashed == CrashStatus.CRASHED)//don't answer to msg if state is crashed
       return;
 
+    if(crashed == CrashStatus.BEFORE_ELECTION) {//don't answer to msg if state is crashed or has to be crashed
+      crashed = CrashStatus.CRASHED;//just say it is crashed to avoid answering/sending any future message
+      System.err.println("[" + getSelf().path().name() + "] CRASHED BEFORE_ELECTION");
+      return;
+    }
+
     //if epoch in which election is running is greater (i.e. synch already done), this election msg need to be ignored
     if(clock.epoch > msg.electionEpoch)
       return;
@@ -766,9 +775,8 @@ public class Replica extends AbstractActor {
         lastUpdateHolders.add(getSelf());
         newElectionmsg = new ElectionMsg(electionMsgCounter, clock.epoch, null, lastUpdateHolders);
 
-      }else if(pendingUpdates.size() > 0 && msg.lastUpdate == null) {//mine considered to be the more recent update, since there is none in the election msg
+      }else if(pendingUpdates.size() > 0 && msg.lastUpdate == null) {//mine considered to be the most recent update, since there is none in the election msg
         //NOTE considered this also as the case in which the WRITEOK has just reached some replicas and not all, thus this can be considered as an old update by other replicas
-        //TODO handle unfinished update, i.e. case in which WRITEOK has not reached everyone... this can be also considered as a last update to repeat to everyone and things would still be okay (I think...)
         ArrayList<ActorRef> lastUpdateHolders = new ArrayList<>();
         lastUpdateHolders.add(getSelf());
         newElectionmsg = new ElectionMsg(electionMsgCounter, clock.epoch, pendingUpdates.getLast(), lastUpdateHolders);
@@ -792,6 +800,13 @@ public class Replica extends AbstractActor {
       timersElectionMsg.put(electionMsgCounter, initTimeout(TIMEOUT_MSG_UNIT * replicas.size(), TIMEOUT_MSG_UNIT * replicas.size(),new ElectionMsgACKTimeout(receivingReplica, newElectionmsg)));
 
     }
+
+    if(crashed == CrashStatus.AFTER_ELECTION) {//don't answer to msg if state is crashed or has to be crashed
+      crashed = CrashStatus.CRASHED;//just say it is crashed to avoid answering/sending any future message
+      System.err.println("[" + getSelf().path().name() + "] CRASHED AFTER_ELECTION");
+      return;
+    }
+
   }
 
   /*  Received ack from following replica during election process
@@ -836,6 +851,9 @@ public class Replica extends AbstractActor {
   /*  Received synchronization msg as result of convergence in election protocol
    * */
   private void onSynchronizationMsg(SynchronizationMsg msg) {
+    if(crashed == CrashStatus.CRASHED || !election)//don't answer to msg if state is crashed or if election has came to conclusion
+      return;
+
     if(msg.electionEpoch < this.clock.epoch) {//this election msg ack was in any case obsolete
       if(timerElectionFailed != null)//make sure the timeout is not valid anymore
         timerElectionFailed.cancel();
