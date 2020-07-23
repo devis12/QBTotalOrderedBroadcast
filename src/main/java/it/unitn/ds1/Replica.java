@@ -803,17 +803,9 @@ public class Replica extends AbstractActor {
     System.out.println("[" + getSelf().path().name() + " " + this.clock + "] received ACK from " + getSender().path().name() + " during election");
 
     //cancel timeout for election msg ack
-    try{
-      timersElectionMsg.get(msg.electionMsgID).cancel();
-      timersElectionMsg.remove(msg.electionMsgID);
-    }catch(NullPointerException nex){
-      System.err.println("[" + getSelf().path().name() + " " + this.clock + "] NULL POINTER ON elMsgACK received for elMsg with ID " + msg.electionMsgID);
-      System.err.println("[" + getSelf().path().name() + " " + this.clock + "] BEFORE FOR ");
-      for(Integer id : timersElectionMsg.keySet())
-        System.err.println("\t[" + getSelf().path().name() + " " + this.clock + "] el msg in timerElMsgACK hashmap with ID " + id);
+    timersElectionMsg.get(msg.electionMsgID).cancel();
+    timersElectionMsg.remove(msg.electionMsgID);
 
-      System.err.println("[" + getSelf().path().name() + " " + this.clock + "] AFTER FOR ");
-    }
   }
 
   /*  Following replica seems to have failed as well, forward to next one
@@ -835,19 +827,9 @@ public class Replica extends AbstractActor {
     electionMsgCounter++;
     sendMessage(receivingReplica, new ElectionMsg(electionMsgCounter, msg.electionMsg.electionEpoch, msg.electionMsg.lastUpdate, msg.electionMsg.lastUpdateHolders));
 
-    try{
-      timersElectionMsg.get(msg.electionMsg.electionMsgID).cancel();
-      timersElectionMsg.remove(msg.electionMsg.electionMsgID);
-      timersElectionMsg.put(electionMsgCounter, initTimeout(TIMEOUT_MSG_UNIT * replicas.size(), TIMEOUT_MSG_UNIT * replicas.size(),new ElectionMsgACKTimeout(receivingReplica, msg.electionMsg)));
-    }catch(NullPointerException nex){
-      nex.printStackTrace();
-      System.err.println("[" + getSelf().path().name() + " " + this.clock + "] NULL POINTER ON elMsgACK NOT received for elMsg with ID " + msg.electionMsg.electionMsgID);
-      System.err.println("[" + getSelf().path().name() + " " + this.clock + "] BEFORE FOR ");
-      for(Integer id : timersElectionMsg.keySet())
-        System.err.println("\t[" + getSelf().path().name() + " " + this.clock + "] el msg in timerElMsgACK hashmap with ID " + id);
-
-      System.err.println("[" + getSelf().path().name() + " " + this.clock + "] AFTER FOR ");
-    }
+    timersElectionMsg.get(msg.electionMsg.electionMsgID).cancel();
+    timersElectionMsg.remove(msg.electionMsg.electionMsgID);
+    timersElectionMsg.put(electionMsgCounter, initTimeout(TIMEOUT_MSG_UNIT * replicas.size(), TIMEOUT_MSG_UNIT * replicas.size(),new ElectionMsgACKTimeout(receivingReplica, msg.electionMsg)));
 
   }
 

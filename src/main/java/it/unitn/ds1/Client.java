@@ -9,7 +9,6 @@ import java.io.IOException;
 import java.io.Serializable;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
-import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
 import java.util.Arrays;
@@ -17,12 +16,10 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Random;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 
 import it.unitn.ds1.Replica.Request;
 import it.unitn.ds1.Replica.RequestType;
 import it.unitn.ds1.Replica.Response;
-import org.omg.CORBA.TIMEOUT;
 import scala.concurrent.duration.Duration;
 
 // The Client actor
@@ -96,27 +93,6 @@ public class Client extends AbstractActor {
       System.err.println("[" + getSelf().path().name() + "] IOException while writing in logfile " + Paths.get(getSelf().path().name()+"_log.txt").toAbsolutePath());
     }
 
-    /*
-    //read scheduling
-    Cancellable timerRead = getContext().system().scheduler().scheduleWithFixedDelay(
-      Duration.create(1, TimeUnit.SECONDS),               // when to start generating messages
-      Duration.create(rnd.nextInt(16), TimeUnit.SECONDS),               // how frequently generate them
-      selectRandomReplica(),                                           // destination actor reference
-      new Request(getSelf(), RequestType.READ, null), // the message to send
-      getContext().system().dispatcher(),                 // system dispatcher
-      getSelf()                                           // source of the message (myself)
-    );
-
-    //write scheduling
-    Cancellable timerWrite = getContext().system().scheduler().scheduleWithFixedDelay(
-      Duration.create(rnd.nextInt(32), TimeUnit.SECONDS),               // when to start generating messages
-      Duration.create(rnd.nextInt(128), TimeUnit.SECONDS),               // how frequently generate them
-      selectRandomReplica(),                                           // destination actor reference
-      new Request(getSelf(), RequestType.WRITE, rnd.nextInt(10)), // the message to send
-      getContext().system().dispatcher(),                 // system dispatcher
-      getSelf()                                           // source of the message (myself)
-    );
-    */
   }
 
   // Here we define our reaction on the received message from the replica containing the value we're interested
