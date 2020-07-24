@@ -217,9 +217,19 @@ public class Replica extends AbstractActor {
     }
   }
 
+  /*  Custom class to contain ActorRef and a boolean to denote its state: active or faulty */
+  private class ReplicaRef {
+    private ActorRef ref;
+    private boolean active;
+    private ReplicaRef(ActorRef ref, boolean active){
+      this.active = active;
+      this.ref = ref;
+    }
+  }
+
 
   // replicas that hold value v to be read and/or modified
-  private List<ActorRef> replicas;
+  private List<ReplicaRef> replicas;
   // value v hold by every replica
   private int v;
   // coordinator reference
@@ -337,11 +347,16 @@ public class Replica extends AbstractActor {
     }
     
     // randomly arrange replicas
-    List<ActorRef> shuffledGroup = new ArrayList<>(replicas);
+    List<ActorRef> shuffledGroup = new ArrayList<>();
+    for(ReplicaRef replica : this.replicas)
+      shuffledGroup.add(replica.ref);
     Collections.shuffle(shuffledGroup);
 
     // multicast to all peers in the group
     for (ActorRef r: shuffledGroup) {
+      if(!isFaulty(r))//avoid sending messages to replicas which you know are faulty
+        continue;
+
       if (broadcast || !r.equals(getSelf()))//avoid sending to yourself in multicast
         sendMessage(r, msg);
 
@@ -415,6 +430,15 @@ public class Replica extends AbstractActor {
     pendingUpdates.remove(upd);
   }
 
+  /*return true if replica is marked as failed*/
+  private boolean isFaulty(ActorRef r){
+    for(ReplicaRef replica : this.replicas)
+      if(replica.ref.equals(r))
+        return !replica.active;
+
+    return true;//it has failed so bad that it doesn't exist
+  }
+
   /*  Append log to logfile
   * */
   private void appendLog(String textToAppend){
@@ -441,21 +465,24 @@ public class Replica extends AbstractActor {
     return true;
   }
 
-  /*  Select in the list of replicas the following replica wrt rep
+  /*  Select in the list of replicas the following NON_FAULTY replica wrt current replica
   *   with an option to skip the coordinator ActorRef (useful in case of election)
   * */
   private ActorRef selectNextReplica(ActorRef rep, boolean skipCoordinator){
     int myIndex = -1;//position of the current replica in the ring
     for(int i=0; i<replicas.size();i++)
-      if(replicas.get(i) == rep)
+      if(replicas.get(i).ref == rep)
         myIndex = i;
 
     int selectIndex = (myIndex + 1 == replicas.size())? 0 : myIndex + 1; //select next index
+    while(!replicas.get(selectIndex).active) { //select a replica that you know as active and non-faulty
+      selectIndex = (selectIndex + 1 == replicas.size()) ? 0 : selectIndex + 1;
 
-    if(skipCoordinator && replicas.get(selectIndex) == coordinatorRef) //in case you want to skip coordinator
-      return replicas.get((selectIndex + 1 == replicas.size())? 0 : selectIndex + 1);
-    else
-      return replicas.get(selectIndex);
+      if(skipCoordinator && replicas.get(selectIndex).ref == coordinatorRef) //in case you want to skip coordinator
+        selectIndex = (selectIndex + 1 == replicas.size()) ? 0 : selectIndex + 1;
+    }
+
+    return replicas.get(selectIndex).ref;
   }
 
   /*  Start election process after coordinator's failure detection
@@ -516,11 +543,21 @@ public class Replica extends AbstractActor {
     timersElectionMsg.clear();
   }
 
+  /*mark the coordinator as failed*/
+  private void markCoordinatorFailed(){
+    for(ReplicaRef replica : this.replicas)
+      if(replica.ref.equals(coordinatorRef))
+        replica.active = false;
+  }
+
   private void onJoinGroupMsg(JoinGroupMsg msg) {
     if(crashed == CrashStatus.CRASHED)//don't answer to msg if state is crashed
       return;
 
-    this.replicas = msg.group;
+    this.replicas = new ArrayList<>();
+    for(ActorRef r : msg.group)
+      replicas.add(new ReplicaRef(r, true));//at the start we assume all replicas are up and running (i.e. not faulty)
+
     this.coordinatorRef = msg.coordinatorRef;
 
     System.out.println("Starting heartbeat process");
@@ -698,6 +735,7 @@ public class Replica extends AbstractActor {
 
     System.err.println("[" + getSelf().path().name() + " " + this.clock + "] FAILURE OF THE COORDINATOR: heartbeat not arrived");
     timerHeartBeat.cancel();
+    markCoordinatorFailed();//now I know coordinator has failed
     initiateElection();//start election process
   }
 
@@ -710,6 +748,7 @@ public class Replica extends AbstractActor {
     cancelPendingUpdTimers();
     if(!election) {
       System.err.println("[" + getSelf().path().name() + " " + this.clock + "] FAILURE OF THE COORDINATOR: reply not arrived after sending updateACK for " + msg.update.v + " - " + msg.update.clock);
+      markCoordinatorFailed();
       initiateElection();//start election process
     }
   }
@@ -745,6 +784,7 @@ public class Replica extends AbstractActor {
       cancelPendingUpdTimers();//cancel pending upd timers
       timerElectionFailed = initTimeout((TIMEOUT_MSG_UNIT * replicas.size()) * replicas.size(), (TIMEOUT_MSG_UNIT * replicas.size()) * replicas.size(), new ElectionFailedMsg());
       electionMsgCounter = 0;
+      markCoordinatorFailed();//now I know coordinator has failed
     }
 
     System.out.println("[" + getSelf().path().name() + " " + this.clock + "] received election msg from " + getSender().path().name() + "(electionEpoch:"+msg.electionEpoch+")");
@@ -836,6 +876,13 @@ public class Replica extends AbstractActor {
     if(crashed == CrashStatus.CRASHED || !election)//don't answer to msg if state is crashed or if election has came to conclusion
       return;
 
+   if(timersElectionMsg.get(msg.electionMsg.electionMsgID) == null)//timer's already been cancelled and dealt with
+      return;
+
+    //now I know that this replica has failed, so I have to mark it accordingly
+    for(ReplicaRef replica : this.replicas)
+      if(replica.ref.equals(msg.receivingReplica))
+        replica.active = false;
     System.out.println("[" + getSelf().path().name() + " " + this.clock + "] not received ACK from " + msg.receivingReplica.path().name() + " during election");
     //send election message to next replica wrt the one that didn't answer causing this timeout
     ActorRef receivingReplica = selectNextReplica(msg.receivingReplica, true);
@@ -910,7 +957,11 @@ public class Replica extends AbstractActor {
    */
   private void onElectionFailedMsg(ElectionFailedMsg msg) {
     timerElectionFailed.cancel();
-    System.out.println("[" + getSelf().path().name() + " " + this.clock + "] received synchronization msg from " + getSender().path().name());
+
+    if(crashed == CrashStatus.CRASHED || !election)//don't answer to msg if state is crashed or if election has came to conclusion
+      return;
+
+    System.out.println("[" + getSelf().path().name() + " " + this.clock + "] ELECTION FAILURE! Restart election ");
     election = false;
     initiateElection();//restart new election
   }
