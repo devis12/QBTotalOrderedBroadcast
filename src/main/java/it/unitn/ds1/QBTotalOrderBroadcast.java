@@ -62,28 +62,23 @@ public class QBTotalOrderBroadcast {
        #           ACTIONS CONTROL LIST              #
        ###############################################
     */
-    
+
+    /*replicas.get(4).tell(new CrashMsg(CrashStatus.BEFORE_ELECTION), null);
+    replicas.get(5).tell(new CrashMsg(CrashStatus.AFTER_ELECTION), null);*/
     clients.get(0).tell(new SendWriteRequest(8), null);
     clients.get(1).tell(new SendWriteRequest(4), null);
-    Thread.sleep(2000);
-    replicas.get(6).tell(new CrashMsg(CrashStatus.CRASHED), null);
     clients.get(0).tell(new SendReadRequest(), null);
-    //replicas.get(6).tell(new CrashMsg(CrashStatus.WRITEOK), null);
     clients.get(1).tell(new SendReadRequest(), null);
     clients.get(0).tell(new SendWriteRequest(17), null);
-    replicas.get(4).tell(new CrashMsg(CrashStatus.BEFORE_ELECTION), null);
-    replicas.get(5).tell(new CrashMsg(CrashStatus.BEFORE_ELECTION), null);
     clients.get(0).tell(new SendReadRequest(), null);
     clients.get(0).tell(new SendWriteRequest(5), null);
     clients.get(1).tell(new SendWriteRequest(2), null);
-    Thread.sleep(200);
+    Thread.sleep(240);
+    replicas.get(6).tell(new CrashMsg(CrashStatus.UPDATE), null);
     clients.get(1).tell(new SendReadRequest(), null);
     clients.get(0).tell(new SendReadRequest(), null);
-    Thread.sleep(800);
     clients.get(1).tell(new SendReadRequest(), null);
-    Thread.sleep(7000);
     clients.get(0).tell(new SendWriteRequest(555), null);
-    Thread.sleep(1200);
     clients.get(1).tell(new SendReadRequest(), null);
     clients.get(0).tell(new SendReadRequest(), null);
     clients.get(0).tell(new SendWriteRequest(712), null);

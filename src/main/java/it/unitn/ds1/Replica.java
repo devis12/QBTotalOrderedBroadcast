@@ -26,9 +26,9 @@ public class Replica extends AbstractActor {
   private static int TIMEOUT_HEARTBEAT_UNIT = 1024;
 
   //Timeout when expepecting messages in response from coordinator (increase it proportional to num of tot replicas)
-  private static int TIMEOUT_MSG_UNIT = 256;
+  private static int TIMEOUT_MSG_UNIT = 512;
   //Max time allowed for link communication delays
-  private static int MAX_NETWORK_DELAY = 64;
+  private static int MAX_NETWORK_DELAY = 16;
 
   public static class GenericMessage implements Serializable{}
 
@@ -153,6 +153,15 @@ public class Replica extends AbstractActor {
     }
   }
 
+  /*Update object that can be packed with an OK flag to denote the fact that the WRITEOK has been already arrived for that update*/
+  public static class UpdateOK extends Update{
+    private boolean okToDeliver;
+    private UpdateOK(LocalTime clock, Integer v, boolean okToDeliver){
+      super(clock, v);
+      this.okToDeliver = okToDeliver;
+    }
+  }
+
   // Update ack messages to be sent to coordinator
   public static class UpdateACK extends GenericMessage{
     public final LocalTime clock;
@@ -249,7 +258,7 @@ public class Replica extends AbstractActor {
   //hashmap containing number of ack received for a given update 
   private HashMap<LocalTime, Integer> ackMap = new HashMap<> ();
   //stack for pending updates
-  private ArrayDeque<Update> pendingUpdates = new ArrayDeque<>();
+  private ArrayDeque<UpdateOK> pendingUpdates = new ArrayDeque<>();
   //local time wrt this replica, which consists in epoch+sequence number
   private LocalTime clock;
   //has the replica crashed? (general crash)
@@ -354,7 +363,7 @@ public class Replica extends AbstractActor {
 
     // multicast to all peers in the group
     for (ActorRef r: shuffledGroup) {
-      if(!isFaulty(r))//avoid sending messages to replicas which you know are faulty
+      if(isFaulty(r))//avoid sending messages to replicas which you know are faulty
         continue;
 
       if (broadcast || !r.equals(getSelf()))//avoid sending to yourself in multicast
@@ -406,12 +415,25 @@ public class Replica extends AbstractActor {
   /*  Check if wokupd can be delivered, i.e. if there isn't any pending updates
   *   such that their clock value is less
   * */
-  private boolean canDeliver(Update upd) {
+  private boolean canDeliver(UpdateOK upd) {
+    if(!upd.okToDeliver)//WRITEOK not arrived for this update
+      return false;
+
     for(Update pupd : pendingUpdates)
       if(pupd.clock.epoch < upd.clock.epoch || pupd.clock.sn < upd.clock.sn)
         return false;
 
     return true;
+  }
+
+  /*  Return a pending update that can be delivered, otherwise null
+   * */
+  private UpdateOK canDeliverSomething() {
+    for(UpdateOK pupd : pendingUpdates)
+      if(canDeliver(pupd))
+        return pupd;
+
+    return null;
   }
 
   private void deliver(Update upd){
@@ -423,7 +445,7 @@ public class Replica extends AbstractActor {
     //write also in log file //Replica <ReplicaID> update <e>:<i> <value>
     appendLog("Replica " + getSelf().path().name() + " update " + upd.clock + " " + upd.v);
 
-    if(!coordinator)//coordinator updates clock when sending update
+    if(!coordinator || synchronization)//coordinator updates clock when sending update, unless we're in synchronization mode
       this.clock = upd.clock;//others will update their clocks when delivering
 
     //delete from pending updates list
@@ -521,8 +543,13 @@ public class Replica extends AbstractActor {
       return;
     synchronization = true;
     System.out.println("[" + getSelf().path().name() + " " + this.clock + "] initiating synchronization to terminate election");
-    //Update pendingUpdate = (pendingUpdates.isEmpty())? null : pendingUpdates.getLast();
-    multicastMessageToReplicas(new SynchronizationMsg(this.clock.epoch, getSelf(), new ArrayDeque<>(pendingUpdates)), true);
+
+    //Convert to list of simple plain Update objects (update ok contains a mutable variable)
+    ArrayDeque<Update> pendingUpdatestoSend = new ArrayDeque<>();
+    for(UpdateOK updOk : pendingUpdates)
+      pendingUpdatestoSend.addLast(new Update(updOk.clock, updOk.v));
+
+    multicastMessageToReplicas(new SynchronizationMsg(this.clock.epoch, getSelf(), pendingUpdatestoSend), true);
   }
 
   /* delete all pending updates' timers
@@ -621,9 +648,9 @@ public class Replica extends AbstractActor {
       return;
     }
 
-    pendingUpdates.addLast(upd);//add to pending updates to be performed
+    pendingUpdates.addLast(new UpdateOK(upd.clock, upd.v, false));//add to pending updates to be performed
     for(Update pupd:pendingUpdates)
-      System.out.println("[" + getSelf().path().name() + " " + this.clock + "] pending update: " + pupd.v + " " + pupd.clock.epoch + "-" + pupd.clock.sn);
+      System.out.println("[" + getSelf().path().name() + " " + this.clock + "] pending update: " + pupd.v + " " + pupd.clock);
 
     sendMessage(coordinatorRef, new UpdateACK(upd.clock, upd.v));
     //start timer to detect coordinator failure while waiting for writeOK of this update
@@ -679,7 +706,8 @@ public class Replica extends AbstractActor {
       return;
     }
 
-    Update confirmedUpdate = Update.toUpdate(wokUpd);
+    Update writeOKUpdate = Update.toUpdate(wokUpd);
+    UpdateOK confirmedUpdate = new UpdateOK(writeOKUpdate.clock, writeOKUpdate.v, true);//this update will be ok to deliver when the others are also arrived
 
     //cancel timeout handler for this update
     if(!coordinator) {//coordinator has already deleted this timer when
@@ -688,19 +716,16 @@ public class Replica extends AbstractActor {
     }
 
     if(canDeliver(confirmedUpdate)){//check if wokupd can be performed
-      //find update within pending updates
-      Update updDel = null;
-      for (Update update : pendingUpdates) {
-        if(update.clock.equals(wokUpd.clock)){
-          updDel = update;
-        }
-      }
 
-      if(updDel != null){
-        deliver(updDel);
-        //check if other pending updates can be delivered? no need assuming fifo and reliable links, writeOK will arrive in the right order
-      }
+      deliver(confirmedUpdate);
+      //check if other pending updates can be delivered? no need... do not assume writeOK will be arrived in right order
+      while((confirmedUpdate = canDeliverSomething()) != null)
+        deliver(confirmedUpdate);
 
+    }else{//ensure that in the list of pendingUpdate it appears with WRITEOK flag set to true
+      for(UpdateOK updOK : pendingUpdates)
+        if(updOK.equals(confirmedUpdate))
+          updOK.okToDeliver = true;
     }
 
     if(crashed == CrashStatus.AFTER_WRITEOK) {//state has to be crashed NOW
@@ -915,7 +940,8 @@ public class Replica extends AbstractActor {
     cancelElectionMsgACKTimers();//you're not waiting for any election msg anymore
     election = false;//election mode terminated
 
-    System.out.println("[" + getSelf().path().name() + " " + this.clock + "] received synchronization msg from " + getSender().path().name());
+    System.out.println("[" + getSelf().path().name() + " " + this.clock + "] received synchronization msg from " + getSender().path().name() +
+            " with " + msg.updsToBePerformed.size() + " updates to be performed");
 
     if(msg.newCoordinator == getSelf()) {
       //current replica is the new coordinator
@@ -933,15 +959,14 @@ public class Replica extends AbstractActor {
 
     //perform last pending update of current epoch, before starting a new one
     if(msg.updsToBePerformed != null) {
-      ArrayDeque<Update> msgPendingUpdates = new ArrayDeque<>(msg.updsToBePerformed);
 
-      for(Update upd : pendingUpdates) {//perform all pending updates
-        msgPendingUpdates.remove(upd);
+      for(Update upd : pendingUpdates)//deliver all pending updates
         deliver(upd);
-      }
 
-      for(Update upd : msgPendingUpdates)//perform all pending updates which the new coordinator has received notification of, while this replica hasn't
-        deliver(upd);
+      for(Update upd : msg.updsToBePerformed)//perform all pending updates which the new coordinator has received notification of, while this replica hasn't
+        if (upd.clock.sn > this.clock.sn)//do not deliver twice the same update: happens if the coordinator has crashed while sending writeOK of some previous update, it can be that this replica has already performed it
+          deliver(upd);
+
     }
 
     //cleanup pending updates of previous epochs because they're obsolete now
