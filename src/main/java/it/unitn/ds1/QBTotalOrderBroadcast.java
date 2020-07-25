@@ -63,34 +63,32 @@ public class QBTotalOrderBroadcast {
        ###############################################
     */
 
-    /*replicas.get(4).tell(new CrashMsg(CrashStatus.BEFORE_ELECTION), null);
-    replicas.get(5).tell(new CrashMsg(CrashStatus.AFTER_ELECTION), null);*/
-    clients.get(0).tell(new SendWriteRequest(8), null);
-    clients.get(1).tell(new SendWriteRequest(4), null);
+    replicas.get(3).tell(new CrashMsg(CrashStatus.AFTER_UPDATE), null);
+    replicas.get(5).tell(new CrashMsg(CrashStatus.BEFORE_ELECTION), null);
+    clients.get(0).tell(new SendWriteRequest(4), null);
+    clients.get(1).tell(new SendWriteRequest(8), null);
     clients.get(0).tell(new SendReadRequest(), null);
-    clients.get(1).tell(new SendReadRequest(), null);
-    clients.get(0).tell(new SendWriteRequest(17), null);
-    clients.get(0).tell(new SendReadRequest(), null);
-    clients.get(0).tell(new SendWriteRequest(5), null);
-    clients.get(1).tell(new SendWriteRequest(2), null);
-    Thread.sleep(240);
-    replicas.get(6).tell(new CrashMsg(CrashStatus.UPDATE), null);
-    clients.get(1).tell(new SendReadRequest(), null);
-    clients.get(0).tell(new SendReadRequest(), null);
-    clients.get(1).tell(new SendReadRequest(), null);
-    clients.get(0).tell(new SendWriteRequest(555), null);
-    clients.get(1).tell(new SendReadRequest(), null);
-    clients.get(0).tell(new SendReadRequest(), null);
-    clients.get(0).tell(new SendWriteRequest(712), null);
-    //replicas.get(5).tell(new CrashMsg(CrashStatus.UPDATE), null);
 
-    System.out.println(">>> Press ENTER to exit <<<");
+    inputContinue();
+    replicas.get(6).tell(new CrashMsg(CrashStatus.WRITEOK), null);
+    clients.get(0).tell(new SendReadRequest(), null);
+    clients.get(0).tell(new SendWriteRequest(12), null);
+
+    inputContinue();
+    clients.get(0).tell(new SendReadRequest(), null);
+    clients.get(0).tell(new SendWriteRequest(32), null);
+
+    inputContinue();
+
+    // system shutdown
+    system.terminate();
+  }
+
+  public static void inputContinue() {
     try {
+      System.out.println(">>> Press ENTER to continue <<<");
       System.in.read();
     }
-    catch (IOException ioe) {}
-    finally {
-      system.terminate();
-    }
+    catch (IOException ignored) {}
   }
 }
